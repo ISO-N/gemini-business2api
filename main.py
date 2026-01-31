@@ -1205,6 +1205,116 @@ async def admin_get_accounts(request: Request):
 
     return {"total": len(accounts_info), "accounts": accounts_info}
 
+@app.get("/admin/scheduled-refresh/states")
+@require_login()
+async def admin_get_scheduled_refresh_states(request: Request):
+    """
+    获取“高级自动刷新调度”的可视化状态（不包含敏感字段）。
+
+    功能说明：
+    - 该接口用于管理面板展示每个账号的调度状态：
+      - next_eligible_at：退避到期时间
+      - consecutive_failures：连续失败次数
+      - avg_refresh_duration_seconds：平均刷新耗时（滑动平均）
+      - last_attempt_at / last_success_at：上次尝试/成功时间
+    - 仅返回与调度相关的非敏感字段，不返回 secure_c_ses/csesidx/config_id 等凭据。
+    - 仅管理员登录后可访问（@require_login）。
+
+    返回值：
+    - dict：包含当前时间、调度配置、以及每个账号的调度状态列表
+    """
+    now_ts = float(time.time())
+    now_beijing = get_beijing_time_str(now_ts)
+
+    # 读取账号列表（数据库模式下可包含已持久化的 scheduled_refresh_state）
+    try:
+        accounts_data = load_accounts_from_source()
+    except Exception as e:
+        logger.error(f"[SCHED] 获取账户配置失败: {str(e)[:200]}")
+        raise HTTPException(500, f"获取账户配置失败: {str(e)}")
+
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        """将任意值安全转换为 float（用于时间戳/耗时等字段）。"""
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """将任意值安全转换为 int（用于计数类字段）。"""
+        try:
+            if value is None:
+                return int(default)
+            return int(value)
+        except Exception:
+            return int(default)
+
+    items: list[dict] = []
+    for account in accounts_data:
+        account_id = str(account.get("id") or "").strip()
+        if not account_id:
+            continue
+
+        state = account.get("scheduled_refresh_state") or {}
+        if not isinstance(state, dict):
+            state = {}
+
+        last_attempt_at = _safe_float(state.get("last_attempt_at"), 0.0)
+        last_success_at = _safe_float(state.get("last_success_at"), 0.0)
+        avg_refresh_duration_seconds = _safe_float(state.get("avg_refresh_duration_seconds"), 0.0)
+        consecutive_failures = _safe_int(state.get("consecutive_failures"), 0)
+        next_eligible_at = _safe_float(state.get("next_eligible_at"), 0.0)
+        last_error = str(state.get("last_error") or "").strip()
+
+        in_backoff = bool(next_eligible_at and next_eligible_at > now_ts)
+        backoff_remaining_seconds = max(next_eligible_at - now_ts, 0.0) if in_backoff else 0.0
+
+        items.append(
+            {
+                "id": account_id,
+                "has_state": bool(state),
+                "last_attempt_at": last_attempt_at,
+                "last_attempt_at_beijing": get_beijing_time_str(last_attempt_at) if last_attempt_at else "",
+                "last_success_at": last_success_at,
+                "last_success_at_beijing": get_beijing_time_str(last_success_at) if last_success_at else "",
+                "avg_refresh_duration_seconds": avg_refresh_duration_seconds,
+                "consecutive_failures": consecutive_failures,
+                "next_eligible_at": next_eligible_at,
+                "next_eligible_at_beijing": get_beijing_time_str(next_eligible_at) if next_eligible_at else "",
+                "in_backoff": in_backoff,
+                "backoff_remaining_seconds": float(round(backoff_remaining_seconds, 3)),
+                # 最近一次错误原因（仅用于面板展示/排查）
+                "last_error": last_error[:500],
+            }
+        )
+
+    # 为面板展示排序：优先显示“退避中”和“连续失败较多”的账号，便于排查风控/验证码问题
+    items.sort(
+        key=lambda x: (
+            0 if x.get("in_backoff") else 1,
+            -int(x.get("consecutive_failures") or 0),
+            -(float(x.get("backoff_remaining_seconds") or 0.0)),
+            x.get("id") or "",
+        )
+    )
+
+    return {
+        "now": now_ts,
+        "now_beijing": now_beijing,
+        "config": {
+            "scheduled_refresh_enabled": bool(config.retry.scheduled_refresh_enabled),
+            "scheduled_refresh_interval_minutes": int(config.retry.scheduled_refresh_interval_minutes or 0),
+            "scheduled_refresh_advanced_enabled": bool(getattr(config.retry, "scheduled_refresh_advanced_enabled", False)),
+            "scheduled_refresh_max_batch_size": int(getattr(config.retry, "scheduled_refresh_max_batch_size", 20) or 20),
+            # 与后端调度器保持一致：内部固定最小批次，用于解释面板行为
+            "scheduled_refresh_min_batch_size": 5,
+        },
+        "total": len(items),
+        "items": items,
+    }
+
 @app.get("/admin/accounts-config")
 @require_login()
 async def admin_get_config(request: Request):
