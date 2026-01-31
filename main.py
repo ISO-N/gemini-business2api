@@ -1478,7 +1478,10 @@ async def admin_get_settings(request: Request):
             "session_cache_ttl_seconds": config.retry.session_cache_ttl_seconds,
             "auto_refresh_accounts_seconds": config.retry.auto_refresh_accounts_seconds,
             "scheduled_refresh_enabled": config.retry.scheduled_refresh_enabled,
-            "scheduled_refresh_interval_minutes": config.retry.scheduled_refresh_interval_minutes
+            "scheduled_refresh_interval_minutes": config.retry.scheduled_refresh_interval_minutes,
+            # 高级自动刷新调度（默认关闭，仅影响“自动定时触发”的刷新）
+            "scheduled_refresh_advanced_enabled": getattr(config.retry, "scheduled_refresh_advanced_enabled", False),
+            "scheduled_refresh_max_batch_size": getattr(config.retry, "scheduled_refresh_max_batch_size", 20),
         },
         "public_display": {
             "logo_url": config.public_display.logo_url,
@@ -1545,6 +1548,9 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         retry.setdefault("auto_refresh_accounts_seconds", config.retry.auto_refresh_accounts_seconds)
         retry.setdefault("scheduled_refresh_enabled", config.retry.scheduled_refresh_enabled)
         retry.setdefault("scheduled_refresh_interval_minutes", config.retry.scheduled_refresh_interval_minutes)
+        # 高级自动刷新调度（可选启用，默认关闭）
+        retry.setdefault("scheduled_refresh_advanced_enabled", getattr(config.retry, "scheduled_refresh_advanced_enabled", False))
+        retry.setdefault("scheduled_refresh_max_batch_size", getattr(config.retry, "scheduled_refresh_max_batch_size", 20))
         retry.setdefault("text_rate_limit_cooldown_seconds", config.retry.text_rate_limit_cooldown_seconds)
         retry.setdefault("images_rate_limit_cooldown_seconds", config.retry.images_rate_limit_cooldown_seconds)
         retry.setdefault("videos_rate_limit_cooldown_seconds", config.retry.videos_rate_limit_cooldown_seconds)
