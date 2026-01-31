@@ -875,6 +875,19 @@
                           </p>
                         </div>
                         <div class="flex items-center gap-2">
+                          <label class="text-xs text-muted-foreground">
+                            每页
+                            <select
+                              v-model.number="scheduledRefreshStatesPageSize"
+                              class="ml-1 rounded-full border border-border bg-background px-2 py-1 text-xs text-foreground"
+                            >
+                              <option :value="10">10</option>
+                              <option :value="20">20</option>
+                              <option :value="50">50</option>
+                              <option :value="100">100</option>
+                              <option :value="0">全部</option>
+                            </select>
+                          </label>
                           <label class="flex items-center gap-2 text-xs text-muted-foreground">
                             <input
                               v-model="onlyShowBackoffAccounts"
@@ -917,7 +930,7 @@
                           </thead>
                           <tbody>
                             <tr
-                              v-for="item in filteredScheduledRefreshStates"
+                              v-for="item in paginatedScheduledRefreshStates"
                               :key="item.id"
                               class="border-b border-border/40 align-top"
                             >
@@ -957,13 +970,43 @@
                                 <span v-else>-</span>
                               </td>
                             </tr>
-                            <tr v-if="filteredScheduledRefreshStates.length === 0">
+                            <tr v-if="paginatedScheduledRefreshStates.length === 0">
                               <td colspan="7" class="py-4 text-center text-xs text-muted-foreground">
                                 暂无可展示的调度状态（可能尚未发生过自动/手动刷新，或被筛选条件隐藏）
                               </td>
                             </tr>
                           </tbody>
                         </table>
+
+                        <div
+                          v-if="scheduledRefreshStatesTotal > 0 && scheduledRefreshStatesPageSize !== 0"
+                          class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
+                        >
+                          <div>
+                            显示第 {{ scheduledRefreshStatesPageStart }}-{{ scheduledRefreshStatesPageEnd }} 条，共 {{ scheduledRefreshStatesTotal }} 条
+                          </div>
+                          <div class="flex items-center gap-2">
+                            <button
+                              type="button"
+                              class="rounded-full border border-border px-3 py-1 transition-colors hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+                              :disabled="scheduledRefreshStatesPage <= 1"
+                              @click="scheduledRefreshStatesPage = Math.max(1, scheduledRefreshStatesPage - 1)"
+                            >
+                              上一页
+                            </button>
+                            <span>
+                              第 {{ scheduledRefreshStatesPage }} / {{ scheduledRefreshStatesTotalPages }} 页
+                            </span>
+                            <button
+                              type="button"
+                              class="rounded-full border border-border px-3 py-1 transition-colors hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+                              :disabled="scheduledRefreshStatesPage >= scheduledRefreshStatesTotalPages"
+                              @click="scheduledRefreshStatesPage = Math.min(scheduledRefreshStatesTotalPages, scheduledRefreshStatesPage + 1)"
+                            >
+                              下一页
+                            </button>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -1347,6 +1390,10 @@ const isLoadingScheduledRefreshStates = ref(false)
 const scheduledRefreshStatesError = ref('')
 // 是否仅展示“退避中”的账号（用于快速排查风控/验证码问题）
 const onlyShowBackoffAccounts = ref(false)
+// 调度状态分页：每页条数（0 表示“全部”）
+const scheduledRefreshStatesPageSize = ref<number>(20)
+// 调度状态分页：当前页（从 1 开始）
+const scheduledRefreshStatesPage = ref<number>(1)
 const cachedSettings = ref<any>(null)  // 缓存配置以避免重复API调用
 const taskHistory = ref<any[]>([])  // 任务历史记录
 const isLoadingHistory = ref(false)  // 加载历史记录状态
@@ -1356,6 +1403,87 @@ const filteredScheduledRefreshStates = computed(() => {
   if (!onlyShowBackoffAccounts.value) return items
   return items.filter(item => item.in_backoff)
 })
+
+const scheduledRefreshStatesTotal = computed(() => filteredScheduledRefreshStates.value.length)
+
+const scheduledRefreshStatesTotalPages = computed(() => {
+  /**
+   * 计算调度状态总页数。
+   *
+   * 说明：
+   * - pageSize=0 表示“全部”，总页数固定为 1；
+   * - 其他情况按向上取整计算。
+   */
+  const total = scheduledRefreshStatesTotal.value
+  const size = scheduledRefreshStatesPageSize.value
+  if (size === 0) return 1
+  if (size <= 0) return 1
+  return Math.max(1, Math.ceil(total / size))
+})
+
+const scheduledRefreshStatesPageStart = computed(() => {
+  /**
+   * 当前页的起始索引（用于展示“第 X-Y 条”）。
+   */
+  const total = scheduledRefreshStatesTotal.value
+  const size = scheduledRefreshStatesPageSize.value
+  if (total <= 0) return 0
+  if (size === 0) return 1
+  return (scheduledRefreshStatesPage.value - 1) * size + 1
+})
+
+const scheduledRefreshStatesPageEnd = computed(() => {
+  /**
+   * 当前页的结束索引（用于展示“第 X-Y 条”）。
+   */
+  const total = scheduledRefreshStatesTotal.value
+  const size = scheduledRefreshStatesPageSize.value
+  if (total <= 0) return 0
+  if (size === 0) return total
+  return Math.min(total, scheduledRefreshStatesPage.value * size)
+})
+
+const paginatedScheduledRefreshStates = computed(() => {
+  /**
+   * 调度状态分页后的数据集合。
+   *
+   * 说明：
+   * - pageSize=0 表示“全部”，直接返回过滤后的全部列表；
+   * - 其他情况按页切片返回。
+   */
+  const items = filteredScheduledRefreshStates.value
+  const size = scheduledRefreshStatesPageSize.value
+  if (size === 0) return items
+  if (size <= 0) return items
+  const start = (scheduledRefreshStatesPage.value - 1) * size
+  const end = start + size
+  return items.slice(start, end)
+})
+
+watch(
+  [onlyShowBackoffAccounts, scheduledRefreshStatesPageSize],
+  () => {
+    /**
+     * 当筛选条件或每页条数变化时，回到第一页，避免页码越界导致“空白页”。
+     */
+    scheduledRefreshStatesPage.value = 1
+  }
+)
+
+watch(
+  [scheduledRefreshStatesTotal, scheduledRefreshStatesTotalPages],
+  () => {
+    /**
+     * 当数据总量变化时，修正当前页不超过最大页数，避免越界。
+     */
+    if (scheduledRefreshStatesPage.value > scheduledRefreshStatesTotalPages.value) {
+      scheduledRefreshStatesPage.value = scheduledRefreshStatesTotalPages.value
+    }
+    if (scheduledRefreshStatesPage.value < 1) {
+      scheduledRefreshStatesPage.value = 1
+    }
+  }
+)
 type TaskLogLine = { time: string; level: string; message: string }
 const registerLogClearMarker = ref<TaskLogLine | null>(null)
 const loginLogClearMarker = ref<TaskLogLine | null>(null)
