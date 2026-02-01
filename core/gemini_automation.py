@@ -1,5 +1,10 @@
 """
-Gemini自动化登录模块（用于新账号注册）
+Gemini 自动化登录模块（DrissionPage 引擎）
+
+说明：
+- 该模块既会被“注册新账号”流程调用，也会被“刷新已有账号”流程调用；
+- 自动化登录的核心验证方式是“邮箱验证码（OTP）”，页面提示仅用于辅助判定；
+- 该模块的行为边界以 `docs/prd/gemini-business-automation-login-refresh-boundaries.md` 为准。
 """
 import os
 import json
@@ -7,7 +12,7 @@ import random
 import string
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Any
 from urllib.parse import quote
 
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -28,7 +33,12 @@ CHROMIUM_PATHS = [
 
 
 def _find_chromium_path() -> Optional[str]:
-    """查找可用的 Chromium/Chrome 浏览器路径"""
+    """
+    查找可用的 Chromium/Chrome 浏览器路径。
+
+    返回值：
+    - Optional[str]：可执行的浏览器路径；找不到则返回 None
+    """
     for path in CHROMIUM_PATHS:
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
@@ -36,7 +46,14 @@ def _find_chromium_path() -> Optional[str]:
 
 
 class GeminiAutomation:
-    """Gemini自动化登录"""
+    """
+    Gemini 自动化登录（DrissionPage）。
+
+    设计要点：
+    - 以“模拟真实用户行为”为目标，但不承诺 100% 绕过风控；
+    - “验证码是否发送成功”的判定优先使用网络监听，其次使用页面提示；
+    - “验证码是否收到”以邮箱为准（最终可信来源）。
+    """
 
     def __init__(
         self,
@@ -46,6 +63,16 @@ class GeminiAutomation:
         timeout: int = 60,
         log_callback=None,
     ) -> None:
+        """
+        初始化自动化实例。
+
+        参数：
+        - user_agent: 浏览器 UA 字符串；为空时会自动生成随机 UA
+        - proxy: 代理地址（例如 http://host:port）；为空则不使用代理
+        - headless: 是否无头模式（DP 支持有头/无头）
+        - timeout: 页面级超时（秒）
+        - log_callback: 日志回调函数，签名为 (level: str, message: str) -> None
+        """
         self.user_agent = user_agent or self._get_ua()
         self.proxy = proxy
         self.headless = headless
@@ -65,7 +92,18 @@ class GeminiAutomation:
                 pass
 
     def login_and_extract(self, email: str, mail_client) -> dict:
-        """执行登录并提取配置"""
+        """
+        执行登录并提取配置。
+
+        参数：
+        - email: 需要登录的邮箱地址（也是账号 ID）
+        - mail_client: 邮箱客户端对象，必须提供 poll_for_code(timeout, interval, since_time) 方法
+
+        返回值：
+        - dict：统一返回结构：
+          - success: bool
+          - config: dict（成功时）/ error: str（失败时）
+        """
         page = None
         user_data_dir = None
         try:
@@ -158,11 +196,44 @@ class GeminiAutomation:
 
         return page
 
-    def _run_flow(self, page, email: str, mail_client) -> dict:
-        """执行登录流程"""
+    def _restart_network_listen(self, page) -> None:
+        """
+        重启网络监听（最佳努力）。
 
-        # 记录开始时间，用于邮件时间过滤
-        from datetime import datetime
+        说明：
+        - 发送验证码时需要抓 `batchexecute` 等请求以判断是否触发风控；
+        - DrissionPage 的 listen 缓冲是“消费型”的，重启可以避免读取到旧包造成误判；
+        - 该方法失败不应影响主流程（因此全部 try/except）。
+        """
+        try:
+            if hasattr(page, "listen") and page.listen:
+                try:
+                    page.listen.stop()
+                except Exception:
+                    pass
+                page.listen.start(
+                    targets=["batchexecute", "browserinfo", "verify-oob-code"],
+                    is_regex=False,
+                    method=("GET", "POST"),
+                    res_type=("XHR", "FETCH", "DOCUMENT"),
+                )
+        except Exception:
+            pass
+
+    def _run_flow(self, page, email: str, mail_client) -> dict:
+        """
+        执行登录流程（验证码邮件验证）。
+
+        参数：
+        - page: ChromiumPage 实例
+        - email: 登录邮箱
+        - mail_client: 邮箱客户端（用于轮询验证码）
+
+        返回值：
+        - dict：与 login_and_extract 相同的 success/config/error 结构
+        """
+
+        # 记录开始时间，用于邮件时间过滤（传入邮箱客户端用于“只读取该时间之后的邮件”）
         send_time = datetime.now()
 
         # Step 1: 导航到首页并设置 Cookie
@@ -181,30 +252,14 @@ class GeminiAutomation:
                 "path": "/",
                 "secure": True,
             })
-            # 添加 reCAPTCHA Cookie
-            page.set.cookies({
-                "name": "_GRECAPTCHA",
-                "value": "09ABCL...",
-                "url": "https://google.com",
-                "path": "/",
-                "secure": True,
-            })
         except Exception as e:
             self._log("warning", f"⚠️ Cookie 设置失败: {e}")
 
         login_hint = quote(email, safe="")
         login_url = f"https://auth.business.gemini.google/login/email?continueUrl=https%3A%2F%2Fbusiness.gemini.google%2F&loginHint={login_hint}&xsrfToken={DEFAULT_XSRF_TOKEN}"
 
-        # 提前启动网络监听，捕获默认发送
-        try:
-            page.listen.start(
-                targets=["batchexecute", "browserinfo", "verify-oob-code"],
-                is_regex=False,
-                method=("GET", "POST"),
-                res_type=("XHR", "FETCH", "DOCUMENT"),
-            )
-        except Exception:
-            pass
+        # 提前启动网络监听（最佳努力）：用于捕获“页面加载后默认触发发送验证码”的请求/响应
+        self._restart_network_listen(page)
 
         page.get(login_url, timeout=self.timeout)
         time.sleep(5)
@@ -218,20 +273,40 @@ class GeminiAutomation:
             self._log("info", "✅ 已登录，提取配置")
             return self._extract_config(page, email)
 
-        # Step 3: 点击发送验证码按钮（最多5次，每次间隔10秒）
+        # Step 3: 点击发送验证码按钮（最多5轮，每轮间隔10秒；遇到明确风控信号则尽快失败）
         self._log("info", "📧 发送验证码...")
-        max_send_rounds = 5
-        send_round = 0
-        while True:
-            send_round += 1
+        max_send_rounds = 5  # 文档边界：最多 5 轮
+        resend_delay_seconds = 10  # 文档边界：失败每轮固定间隔 10 秒
+        send_ok = False
+
+        for send_round in range(1, max_send_rounds + 1):
+            # 从第二轮起重启一次网络监听，避免读取到旧包造成误判；首轮保留“提前监听”的包用于判定
+            if send_round > 1:
+                self._restart_network_listen(page)
+            self._last_send_error = ""
+
             if self._click_send_code_button(page):
+                send_ok = True
                 break
-            if send_round >= max_send_rounds:
-                self._log("error", "❌ 验证码发送失败（可能触发风控），建议更换代理IP")
-                self._save_screenshot(page, "send_code_button_failed")
-                return {"success": False, "error": "send code failed after retries"}
-            self._log("warning", f"⚠️ 发送失败，10秒后重试 ({send_round}/{max_send_rounds})")
-            time.sleep(10)
+
+            # 遇到明确风控/发送失败信号时，尽快失败并给出建议（避免长时间空等）
+            if self._last_send_error in ("captcha_check_failed", "send_email_otp_error"):
+                self._log("error", "❌ 检测到风控/发送失败信号，建议更换代理/IP 并降低刷新频率")
+                self._save_screenshot(page, "send_code_risk_or_failed")
+                self._stop_listen(page)
+                return {"success": False, "error": self._last_send_error}
+
+            if send_round < max_send_rounds:
+                self._log("warning", f"⚠️ 发送失败，{resend_delay_seconds}秒后重试 ({send_round}/{max_send_rounds})")
+                time.sleep(resend_delay_seconds)
+
+        # 发送阶段结束后停止监听，避免后续流程无限积累监听缓冲
+        self._stop_listen(page)
+
+        if not send_ok:
+            self._log("error", "❌ 验证码发送失败（可能触发风控），建议更换代理IP")
+            self._save_screenshot(page, "send_code_button_failed")
+            return {"success": False, "error": "send code failed after retries"}
 
         # Step 4: 等待验证码输入框出现
         code_input = self._wait_for_code_input(page)
@@ -331,85 +406,87 @@ class GeminiAutomation:
         return self._extract_config(page, email)
 
     def _click_send_code_button(self, page) -> bool:
-        """点击发送验证码按钮（如果需要）"""
-        time.sleep(2)
-        max_send_attempts = 5
-        resend_delay_seconds = 10
+        """
+        点击发送验证码按钮（单次尝试）。
 
-        # 方法1: 直接通过ID查找
+        说明：
+        - 该方法只负责“找按钮 + 点一次 + 做一次发送成功判定”；
+        - 重试策略由上层（_run_flow 的 Step 3）控制，避免出现重复叠加的重试；
+        - 若已经进入验证码输入页，则通常表示验证码已触发发送（或发送入口已通过），直接继续流程。
+
+        参数：
+        - page: ChromiumPage 页面对象
+
+        返回值：
+        - bool：True 表示“允许继续流程”（发送成功或无法判断但保守继续）；
+                False 表示“明确失败”（例如检测到风控信号、页面报错、按钮缺失/不可点击）。
+        """
+        time.sleep(2)
+
+        # 若已出现验证码输入框，视为已进入验证阶段，不再重复点发送按钮。
+        code_input = page.ele("css:input[jsname='ovqh0b']", timeout=1) or page.ele(
+            "css:input[name='pinInput']",
+            timeout=1,
+        )
+        if code_input:
+            self._log("info", "✅ 已在验证码输入页面（跳过发送按钮点击）")
+            return True
+
+        # 方法1: 直接通过 ID 查找（优先）
         direct_btn = page.ele("#sign-in-with-email", timeout=5)
         if direct_btn:
-            for attempt in range(1, max_send_attempts + 1):
-                try:
-                    self._last_send_error = ""
-                    direct_btn.click()
-                    if self._verify_code_send_by_network(page) or self._verify_code_send_status(page):
-                        self._stop_listen(page)
-                        return True
-                    if self._last_send_error == "captcha_check_failed":
-                        self._log("error", f"❌ 触发风控，建议更换代理IP ({attempt}/{max_send_attempts})")
-                    else:
-                        self._log("warning", f"⚠️ 发送失败，{resend_delay_seconds}秒后重试 ({attempt}/{max_send_attempts})")
-                    time.sleep(resend_delay_seconds)
-                except Exception as e:
-                    self._log("warning", f"⚠️ 点击失败: {e}")
-            self._stop_listen(page)
-            return False
+            try:
+                direct_btn.click()
+                return self._verify_send_code_after_click(page)
+            except Exception as e:
+                self._last_send_error = "send_button_click_failed"
+                self._log("warning", f"⚠️ 点击失败: {e}")
+                return False
 
-        # 方法2: 通过关键词查找
+        # 方法2: 通过关键词查找按钮
         keywords = ["通过电子邮件发送验证码", "通过电子邮件发送", "email", "Email", "Send code", "Send verification", "Verification code"]
         try:
             buttons = page.eles("tag:button")
             for btn in buttons:
                 text = (btn.text or "").strip()
                 if text and any(kw in text for kw in keywords):
-                    for attempt in range(1, max_send_attempts + 1):
-                        try:
-                            self._last_send_error = ""
-                            btn.click()
-                            if self._verify_code_send_by_network(page) or self._verify_code_send_status(page):
-                                self._stop_listen(page)
-                                return True
-                            if self._last_send_error == "captcha_check_failed":
-                                self._log("error", f"❌ 触发风控，建议更换代理IP ({attempt}/{max_send_attempts})")
-                            else:
-                                self._log("warning", f"⚠️ 发送失败，{resend_delay_seconds}秒后重试 ({attempt}/{max_send_attempts})")
-                            time.sleep(resend_delay_seconds)
-                        except Exception as e:
-                            self._log("warning", f"⚠️ 点击失败: {e}")
-                    self._stop_listen(page)
-                    return False
+                    try:
+                        btn.click()
+                        return self._verify_send_code_after_click(page)
+                    except Exception as e:
+                        self._last_send_error = "send_button_click_failed"
+                        self._log("warning", f"⚠️ 点击失败: {e}")
+                        return False
         except Exception as e:
             self._log("warning", f"⚠️ 搜索按钮异常: {e}")
 
-        # 检查是否已经在验证码输入页面
-        code_input = page.ele("css:input[jsname='ovqh0b']", timeout=2) or page.ele("css:input[name='pinInput']", timeout=1)
-        if code_input:
-            self._stop_listen(page)
-            self._log("info", "✅ 已在验证码输入页面")
-
-            # 直接点击重新发送按钮（不管之前是否发送过）
-            if self._click_resend_code_button(page):
-                self._log("info", "✅ 已点击重新发送按钮")
-                return True
-            else:
-                self._log("warning", "⚠️ 未找到重新发送按钮，继续流程")
-                return True
-
-        self._stop_listen(page)
+        # 仍未找到发送按钮，且也不在验证码输入页面：明确失败
+        self._last_send_error = "send_button_not_found"
         self._log("error", "❌ 未找到发送验证码按钮")
         return False
 
     def _stop_listen(self, page) -> None:
-        """安全地停止网络监听"""
+        """
+        安全地停止网络监听（最佳努力）。
+
+        参数：
+        - page: ChromiumPage 页面对象
+        """
         try:
             if hasattr(page, 'listen') and page.listen:
                 page.listen.stop()
         except Exception:
             pass
 
-    def _verify_code_send_by_network(self, page) -> bool:
-        """通过监听网络请求验证验证码是否成功发送"""
+    def _verify_code_send_by_network(self, page) -> Optional[bool]:
+        """
+        通过监听网络请求验证验证码是否成功发送（优先级最高）。
+
+        返回值语义：
+        - True：捕获到关键请求，且未发现明确错误信号 → 认为发送成功
+        - False：捕获到关键请求，且发现 `CAPTCHA_CHECK_FAILED` / `SendEmailOtpError` → 认为发送失败（风控/发送失败）
+        - None：未捕获到关键请求/监听不可用 → 无法判断（交由页面提示或邮箱收码最终判定）
+        """
         try:
             time.sleep(1)
 
@@ -427,10 +504,10 @@ class GeminiAutomation:
                     else:
                         break
             except Exception:
-                return False
+                return None
 
             if not packets:
-                return False
+                return None
 
             # 保存网络日志（仅用于调试）
             self._save_network_packets(packets)
@@ -467,13 +544,20 @@ class GeminiAutomation:
                     return False
                 return True
             else:
-                return False
+                return None
 
         except Exception:
-            return False
+            return None
 
-    def _verify_code_send_status(self, page) -> bool:
-        """检测页面提示判断是否发送成功"""
+    def _verify_code_send_status(self, page) -> Optional[bool]:
+        """
+        检测页面提示判断是否发送成功（辅助判定）。
+
+        返回值语义：
+        - True：命中成功提示关键词
+        - False：命中错误提示关键词
+        - None：未找到可判断的提示（上层按“保守继续”策略处理）
+        """
         time.sleep(2)
         try:
             success_keywords = ["验证码已发送", "code sent", "email sent", "check your email", "已发送"]
@@ -499,16 +583,55 @@ class GeminiAutomation:
                         if not text:
                             continue
                         if any(kw in text for kw in error_keywords):
+                            self._last_send_error = "send_toast_error"
                             return False
                         if any(kw in text for kw in success_keywords):
                             return True
                 except Exception:
                     continue
-            return True
+            return None
         except Exception:
+            return None
+
+    def _verify_send_code_after_click(self, page) -> bool:
+        """
+        在“点击发送验证码”之后，综合网络监听与页面提示进行判定。
+
+        判定优先级：
+        1) 网络监听：若捕获到明确错误信号（CAPTCHA/SendEmailOtpError）则立即判定失败；
+        2) 页面提示：若捕获到错误提示则失败；若捕获到成功提示则成功；
+        3) 无法判断：按产品边界“保守继续流程”，最终以邮箱收码为准。
+
+        参数：
+        - page: ChromiumPage 页面对象
+
+        返回值：
+        - bool：是否允许继续流程
+        """
+        network_result = self._verify_code_send_by_network(page)
+        if network_result is True:
             return True
+        if network_result is False:
+            # 明确风控/发送失败：不允许继续，避免进入长时间空等
+            return False
+
+        toast_result = self._verify_code_send_status(page)
+        if toast_result is False:
+            return False
+        # toast_result=True 或 None：均按“保守继续流程”处理
+        return True
 
     def _truncate_text(self, text: str, max_len: int = 2000) -> str:
+        """
+        截断文本，避免日志/抓包文件过大。
+
+        参数：
+        - text: 原始文本
+        - max_len: 最大保留长度
+
+        返回值：
+        - str：截断后的文本
+        """
         if text is None:
             return ""
         if len(text) <= max_len:
@@ -516,7 +639,13 @@ class GeminiAutomation:
         return text[:max_len] + f"...(truncated, total={len(text)})"
 
     def _save_network_packets(self, packets) -> None:
-        """保存网络日志（仅用于调试）"""
+        """
+        保存网络日志（仅用于调试）。
+
+        安全/隐私说明：
+        - 网络日志属于本地文件证据，禁止通过公开接口直接暴露；
+        - 本方法会对 body/postData 做截断与字符串化，避免写入不可序列化对象或过大内容。
+        """
         try:
             from core.storage import _data_file_path
             base_dir = _data_file_path(os.path.join("logs", "network"))
@@ -524,11 +653,48 @@ class GeminiAutomation:
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             file_path = os.path.join(base_dir, f"network-{ts}.jsonl")
 
-            def safe_str(value):
+            def safe_str(value: Any, max_len: int = 2000) -> str:
+                """
+                将任意对象转换为可写入 JSONL 的字符串（并做长度截断）。
+
+                参数：
+                - value: 任意对象（可能是 bytes/dict/list/异常等）
+                - max_len: 最大长度（字符）
+
+                返回值：
+                - str：可读字符串
+                """
                 try:
-                    return value if isinstance(value, str) else str(value)
+                    if value is None:
+                        return ""
+                    if isinstance(value, (bytes, bytearray)):
+                        try:
+                            text = value.decode("utf-8", errors="replace")
+                        except Exception:
+                            text = repr(value)
+                        return self._truncate_text(text, max_len=max_len)
+                    if isinstance(value, str):
+                        return self._truncate_text(value, max_len=max_len)
+                    return self._truncate_text(str(value), max_len=max_len)
                 except Exception:
                     return "<unprintable>"
+
+            def safe_headers(headers: Any) -> dict:
+                """
+                将 headers 规范化为 dict[str, str]，避免写入不可序列化对象。
+
+                参数：
+                - headers: 原始 headers（可能是 dict/None/其他类型）
+
+                返回值：
+                - dict：规范化后的 headers
+                """
+                if not headers or not isinstance(headers, dict):
+                    return {}
+                result: dict = {}
+                for k, v in headers.items():
+                    result[safe_str(k, max_len=256)] = safe_str(v, max_len=512)
+                return result
 
             with open(file_path, "a", encoding="utf-8") as f:
                 for packet in packets:
@@ -544,13 +710,13 @@ class GeminiAutomation:
                             "is_failed": bool(packet.is_failed) if hasattr(packet, "is_failed") else False,
                             "fail_info": safe_str(fail) if fail else "",
                             "request": {
-                                "headers": req.headers if req and hasattr(req, "headers") else {},
-                                "postData": req.postData if req and hasattr(req, "postData") else "",
+                                "headers": safe_headers(req.headers) if req and hasattr(req, "headers") else {},
+                                "postData": safe_str(req.postData, max_len=4000) if req and hasattr(req, "postData") else "",
                             },
                             "response": {
                                 "status": resp.status if resp and hasattr(resp, "status") else 0,
-                                "headers": resp.headers if resp and hasattr(resp, "headers") else {},
-                                "raw_body": resp.raw_body if resp and hasattr(resp, "raw_body") else "",
+                                "headers": safe_headers(resp.headers) if resp and hasattr(resp, "headers") else {},
+                                "raw_body": safe_str(resp.raw_body, max_len=8000) if resp and hasattr(resp, "raw_body") else "",
                             },
                         }
                         f.write(json.dumps(item, ensure_ascii=False) + "\n")
