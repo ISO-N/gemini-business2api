@@ -209,6 +209,20 @@ export interface ScheduledRefreshStatesResponse {
   items: ScheduledRefreshStateItem[]
 }
 
+/**
+ * 清除“高级自动刷新调度退避”的响应结构。
+ *
+ * 说明：
+ * - 该接口用于管理面板提供“一键清除退避（按账号/按全部）”；
+ * - 后端会返回本次清除的数量、跳过数量与错误信息。
+ */
+export interface ClearScheduledRefreshBackoffResponse {
+  status: string
+  cleared_count: number
+  skipped_count: number
+  errors: string[]
+}
+
 export interface LogEntry {
   time: string
   level: 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL' | 'DEBUG'

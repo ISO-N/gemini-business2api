@@ -1050,6 +1050,23 @@ class ImageGenerationRequest(BaseModel):
     quality: Optional[str] = "standard"  # "standard" or "hd"
     style: Optional[str] = "natural"  # "natural" or "vivid"
 
+
+class ClearScheduledRefreshBackoffRequest(BaseModel):
+    """
+    清除“高级自动刷新调度退避”的请求体。
+
+    参数：
+    - account_ids: 可选，指定要清除退避的账号 ID 列表：
+      - None 或 []：对所有账号执行清除
+      - 非空列表：仅对列表中的账号执行清除
+
+    返回值：
+    - BaseModel：FastAPI 会将请求 JSON 解析为该对象
+    """
+
+    account_ids: list[str] | None = None
+
+
 def create_chunk(id: str, created: int, model: str, delta: dict, finish_reason: Union[str, None]) -> str:
     chunk = {
         "id": id,
@@ -1283,6 +1300,108 @@ async def admin_get_scheduled_refresh_states(request: Request):
         },
         "total": len(items),
         "items": items,
+    }
+
+
+@app.post("/admin/scheduled-refresh/clear-backoff")
+@require_login()
+async def admin_clear_scheduled_refresh_backoff(
+    request: Request,
+    payload: ClearScheduledRefreshBackoffRequest = Body(default=ClearScheduledRefreshBackoffRequest()),
+):
+    """
+    一键清除“高级自动刷新调度”的退避时间（next_eligible_at）与连续失败计数。
+
+    功能说明：
+    - 该接口用于管理面板提供“按账号/按全部”的一键清除退避能力；
+    - 仅影响自动定时刷新调度的候选过滤（next_eligible_at > now 会被跳过），不影响手动刷新；
+    - 清除后会将：
+      - scheduled_refresh_state.next_eligible_at 置 0
+      - scheduled_refresh_state.consecutive_failures 置 0
+      其他字段（如 last_attempt_at/avg_refresh_duration_seconds/last_error）默认保留，便于排查历史问题。
+
+    参数：
+    - payload.account_ids:
+      - None 或 []：对所有账号执行清除（仅对“确实处于退避或有失败计数”的账号写库，避免无意义写入）
+      - 非空列表：仅对指定账号执行清除（若账号不存在会返回 errors）
+
+    返回值：
+    - dict：包含清除数量、跳过数量与错误信息列表
+    """
+    now_ts = float(time.time())
+
+    # 读取账号列表（包含 scheduled_refresh_state）
+    try:
+        accounts_data = load_accounts_from_source()
+    except Exception as exc:
+        logger.error(f"[SCHED] 获取账户配置失败: {str(exc)[:200]}")
+        raise HTTPException(500, f"获取账户配置失败: {str(exc)}")
+
+    # 构建 id -> state 映射，避免后续重复遍历
+    id_to_state: dict[str, dict] = {}
+    for account in accounts_data:
+        account_id = str((account or {}).get("id") or "").strip()
+        if not account_id:
+            continue
+        state = (account or {}).get("scheduled_refresh_state") or {}
+        if not isinstance(state, dict):
+            state = {}
+        id_to_state[account_id] = state
+
+    requested_ids = payload.account_ids or []
+    requested_ids = [str(x or "").strip() for x in requested_ids if str(x or "").strip()]
+    target_ids = requested_ids if requested_ids else list(id_to_state.keys())
+
+    cleared_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+
+    for account_id in target_ids:
+        if account_id not in id_to_state:
+            errors.append(f"账号不存在: {account_id}")
+            continue
+
+        state = id_to_state.get(account_id) or {}
+        next_eligible_at = 0.0
+        consecutive_failures = 0
+        try:
+            next_eligible_at = float(state.get("next_eligible_at", 0.0) or 0.0)
+        except Exception:
+            next_eligible_at = 0.0
+        try:
+            consecutive_failures = int(state.get("consecutive_failures", 0) or 0)
+        except Exception:
+            consecutive_failures = 0
+
+        # “按全部清除”时，只对确实需要清除的账号写库，避免大量无意义写入。
+        # “按账号清除”时，依然遵循该判断：如果本就没有退避/失败计数，则直接跳过并返回统计。
+        in_backoff = bool(next_eligible_at and next_eligible_at > now_ts)
+        should_clear = bool(in_backoff or consecutive_failures > 0)
+        if not should_clear:
+            skipped_count += 1
+            continue
+
+        # 保留历史字段，只重置退避与失败计数。
+        new_state = dict(state)
+        new_state["next_eligible_at"] = 0.0
+        new_state["consecutive_failures"] = 0
+
+        try:
+            ok = storage.update_account_scheduled_refresh_state_sync(account_id, new_state)
+        except Exception as exc:
+            ok = False
+            errors.append(f"写入失败: {account_id}: {type(exc).__name__}: {str(exc)[:120]}")
+
+        if ok:
+            cleared_count += 1
+        else:
+            errors.append(f"写入失败: {account_id}")
+
+    return {
+        "status": "success",
+        "cleared_count": int(cleared_count),
+        "skipped_count": int(skipped_count),
+        "errors": errors[:200],
     }
 
 @app.get("/admin/accounts-config")

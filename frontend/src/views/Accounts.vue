@@ -927,14 +927,14 @@
                     </div>
 
                     <div class="rounded-2xl border border-border bg-card px-4 py-3">
-                      <div class="flex flex-wrap items-center justify-between gap-3">
-                        <div>
-                          <p class="text-sm font-medium text-foreground">调度状态（可视化）</p>
-                          <p class="mt-1 text-xs text-muted-foreground">
-                            展示每个账号的退避到期时间、连续失败与平均耗时，便于判断是否处于风控/验证码等异常状态
-                          </p>
-                        </div>
-                        <div class="flex items-center gap-2">
+	                      <div class="flex flex-wrap items-center justify-between gap-3">
+	                        <div>
+	                          <p class="text-sm font-medium text-foreground">调度状态（可视化）</p>
+	                          <p class="mt-1 text-xs text-muted-foreground">
+	                            展示每个账号的退避到期时间、连续失败与平均耗时，便于判断是否处于风控/验证码等异常状态
+	                          </p>
+	                        </div>
+	                        <div class="flex items-center gap-2">
                           <label class="text-xs text-muted-foreground">
                             每页
                             <select
@@ -956,16 +956,24 @@
                             />
                             仅看退避中
                           </label>
-                          <button
-                            class="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors
-                                   hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
-                            :disabled="isLoadingScheduledRefreshStates"
-                            @click="loadScheduledRefreshStates"
-                          >
-                            刷新状态
-                          </button>
-                        </div>
-                      </div>
+	                          <button
+	                            class="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors
+	                                   hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+	                            :disabled="isLoadingScheduledRefreshStates"
+	                            @click="loadScheduledRefreshStates"
+	                          >
+	                            刷新状态
+	                          </button>
+	                          <button
+	                            class="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors
+	                                   hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+	                            :disabled="isClearingScheduledBackoff"
+	                            @click="clearScheduledBackoffAll"
+	                          >
+	                            清除全部退避
+	                          </button>
+	                        </div>
+	                      </div>
 
                       <div v-if="scheduledRefreshStatesError" class="mt-3 rounded-2xl bg-destructive/10 px-3 py-2 text-xs text-destructive">
                         {{ scheduledRefreshStatesError }}
@@ -977,18 +985,19 @@
 
                       <div v-else class="mt-3 overflow-x-auto">
                         <table class="w-full text-left text-xs">
-                          <thead class="text-muted-foreground">
-                            <tr class="border-b border-border/60">
-                              <th class="py-2 pr-3 font-medium">账号</th>
-                              <th class="py-2 pr-3 font-medium">连续失败</th>
-                              <th class="py-2 pr-3 font-medium">平均耗时(s)</th>
-                              <th class="py-2 pr-3 font-medium">退避到期</th>
-                              <th class="py-2 pr-3 font-medium">上次尝试</th>
-                              <th class="py-2 pr-3 font-medium">上次成功</th>
-                              <th class="py-2 pr-3 font-medium">最近失败原因</th>
-                            </tr>
-                          </thead>
-                          <tbody>
+	                          <thead class="text-muted-foreground">
+	                            <tr class="border-b border-border/60">
+	                              <th class="py-2 pr-3 font-medium">账号</th>
+	                              <th class="py-2 pr-3 font-medium">连续失败</th>
+	                              <th class="py-2 pr-3 font-medium">平均耗时(s)</th>
+	                              <th class="py-2 pr-3 font-medium">退避到期</th>
+	                              <th class="py-2 pr-3 font-medium">上次尝试</th>
+	                              <th class="py-2 pr-3 font-medium">上次成功</th>
+	                              <th class="py-2 pr-3 font-medium">最近失败原因</th>
+	                              <th class="py-2 pr-3 font-medium">操作</th>
+	                            </tr>
+	                          </thead>
+	                          <tbody>
                             <tr
                               v-for="item in paginatedScheduledRefreshStates"
                               :key="item.id"
@@ -1023,13 +1032,24 @@
                               <td class="py-2 pr-3 text-muted-foreground">
                                 {{ item.last_success_at_beijing || '-' }}
                               </td>
-                              <td class="py-2 pr-3 text-muted-foreground">
-                                <span v-if="item.last_error" class="break-words">
-                                  {{ item.last_error }}
-                                </span>
-                                <span v-else>-</span>
-                              </td>
-                            </tr>
+	                              <td class="py-2 pr-3 text-muted-foreground">
+	                                <span v-if="item.last_error" class="break-words">
+	                                  {{ item.last_error }}
+	                                </span>
+	                                <span v-else>-</span>
+	                              </td>
+	                              <td class="py-2 pr-3">
+	                                <button
+	                                  type="button"
+	                                  class="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors
+	                                         hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+	                                  :disabled="isClearingScheduledBackoff || (!item.in_backoff && item.consecutive_failures <= 0)"
+	                                  @click="clearScheduledBackoffForAccount(item.id)"
+	                                >
+	                                  清除退避
+	                                </button>
+	                              </td>
+	                            </tr>
                             <tr v-if="paginatedScheduledRefreshStates.length === 0">
                               <td colspan="7" class="py-4 text-center text-xs text-muted-foreground">
                                 暂无可展示的调度状态（可能尚未发生过自动/手动刷新，或被筛选条件隐藏）
@@ -2389,6 +2409,72 @@ const loadScheduledRefreshStates = async () => {
     scheduledRefreshStates.value = []
   } finally {
     isLoadingScheduledRefreshStates.value = false
+  }
+}
+
+// 是否正在执行“清除退避”（避免重复点击）
+const isClearingScheduledBackoff = ref(false)
+
+const clearScheduledBackoffAll = async () => {
+  /**
+   * 清除全部账号的“高级自动刷新调度退避”。
+   *
+   * 功能说明：
+   * - 调用后端 `/admin/scheduled-refresh/clear-backoff`（account_ids 为空）；
+   * - 后端会仅对确实处于退避/有失败计数的账号写库，避免无意义写入；
+   * - 执行完成后刷新调度状态，方便立刻确认效果。
+   */
+  const confirmed = await confirmDialog.ask({
+    title: '清除全部退避',
+    message: '确定要清除所有账号的退避时间与连续失败计数吗？该操作会让账号重新参与自动调度。',
+    confirmText: '清除',
+  })
+  if (!confirmed) return
+  isClearingScheduledBackoff.value = true
+  try {
+    const res = await accountsApi.clearScheduledRefreshBackoff([])
+    toast.success(`已清除退避：${res.cleared_count}，跳过：${res.skipped_count}`)
+    if (Array.isArray(res.errors) && res.errors.length) {
+      toast.error(res.errors[0] || '部分账号清除失败')
+    }
+    await loadScheduledRefreshStates()
+  } catch (error: any) {
+    toast.error(error?.message || '清除退避失败')
+  } finally {
+    isClearingScheduledBackoff.value = false
+  }
+}
+
+const clearScheduledBackoffForAccount = async (accountId: string) => {
+  /**
+   * 清除单个账号的“高级自动刷新调度退避”。
+   *
+   * 参数：
+   * - accountId: 账号 ID
+   *
+   * 返回值：
+   * - Promise<void>
+   */
+  const id = String(accountId || '').trim()
+  if (!id) return
+  const confirmed = await confirmDialog.ask({
+    title: '清除退避',
+    message: `确定要清除账号 ${id} 的退避时间与连续失败计数吗？`,
+    confirmText: '清除',
+  })
+  if (!confirmed) return
+  isClearingScheduledBackoff.value = true
+  try {
+    const res = await accountsApi.clearScheduledRefreshBackoff([id])
+    toast.success(`已清除退避：${res.cleared_count}，跳过：${res.skipped_count}`)
+    if (Array.isArray(res.errors) && res.errors.length) {
+      toast.error(res.errors[0] || '清除失败')
+    }
+    await loadScheduledRefreshStates()
+  } catch (error: any) {
+    toast.error(error?.message || '清除退避失败')
+  } finally {
+    isClearingScheduledBackoff.value = false
   }
 }
 

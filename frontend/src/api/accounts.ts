@@ -4,8 +4,9 @@ import type {
   AccountsListResponse,
   AccountConfigItem,
   RegisterTask,
-  LoginTask,
-  ScheduledRefreshStatesResponse,
+	LoginTask,
+	ScheduledRefreshStatesResponse,
+	ClearScheduledRefreshBackoffResponse,
 } from '@/types/api'
 
 export const accountsApi = {
@@ -92,7 +93,16 @@ export const accountsApi = {
   getAutoRefreshStatus: () =>
     apiClient.get<never, { paused: boolean; status: string }>('/admin/auto-refresh/status'),
 
-  // 获取“高级自动刷新调度”状态（用于面板可视化）
-  getScheduledRefreshStates: () =>
-    apiClient.get<never, ScheduledRefreshStatesResponse>('/admin/scheduled-refresh/states'),
+	// 获取“高级自动刷新调度”状态（用于面板可视化）
+	getScheduledRefreshStates: () =>
+		apiClient.get<never, ScheduledRefreshStatesResponse>('/admin/scheduled-refresh/states'),
+
+	// 清除“高级自动刷新调度退避”（按账号/按全部）
+	// 参数说明：
+	// - accountIds 为空数组：表示对所有账号执行清除（由后端决定实际需要写库的账号集合）
+	// - accountIds 非空：仅清除指定账号
+	clearScheduledRefreshBackoff: (accountIds: string[]) =>
+		apiClient.post<never, ClearScheduledRefreshBackoffResponse>('/admin/scheduled-refresh/clear-backoff', {
+			account_ids: accountIds,
+		}),
 }
