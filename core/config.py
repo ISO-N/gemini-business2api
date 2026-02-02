@@ -118,6 +118,15 @@ class RetryConfig(BaseModel):
         le=200,
         description="高级调度：单轮最多入队刷新账号数（过小会被内部最小批次覆盖）",
     )
+    scheduled_refresh_rotate_every_batches: int = Field(
+        default=1,
+        ge=0,
+        le=1000,
+        description=(
+            "自动定时刷新：完成多少个批次后轮换一次代理节点（用于配合 mihomo 等代理控制器）。"
+            "0 表示禁用自动轮换；1 表示每个批次结束都轮换一次；N 表示每完成 N 个批次轮换一次。"
+        ),
+    )
 
 class PublicDisplayConfig(BaseModel):
     """公开展示配置"""

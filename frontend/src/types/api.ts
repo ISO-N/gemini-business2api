@@ -125,6 +125,15 @@ export interface Settings {
      * - 该值过小会被后端最小批次覆盖。
      */
     scheduled_refresh_max_batch_size?: number
+    /**
+     * 自动定时刷新：完成多少个“批次任务”后轮换一次代理节点（配合 mihomo 等代理控制器）。
+     *
+     * 说明：
+     * - 0：禁用自动轮换；
+     * - 1：每个批次结束都轮换一次（默认）；
+     * - N：每完成 N 个批次轮换一次。
+     */
+    scheduled_refresh_rotate_every_batches?: number
   }
   public_display: {
     logo_url?: string
@@ -190,6 +199,8 @@ export interface ScheduledRefreshStatesResponse {
     scheduled_refresh_interval_minutes: number
     scheduled_refresh_advanced_enabled: boolean
     scheduled_refresh_max_batch_size: number
+    /** 完成多少个批次后轮换一次代理节点（用于 mihomo 轮换） */
+    scheduled_refresh_rotate_every_batches: number
     scheduled_refresh_min_batch_size: number
   }
   /** 账号条目数量 */

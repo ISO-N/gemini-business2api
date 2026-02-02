@@ -1274,6 +1274,10 @@ async def admin_get_scheduled_refresh_states(request: Request):
             "scheduled_refresh_interval_minutes": int(config.retry.scheduled_refresh_interval_minutes or 0),
             "scheduled_refresh_advanced_enabled": bool(getattr(config.retry, "scheduled_refresh_advanced_enabled", False)),
             "scheduled_refresh_max_batch_size": int(getattr(config.retry, "scheduled_refresh_max_batch_size", 20) or 20),
+            # 轮换策略：完成多少个“批次任务”后再切换一次代理节点（用于降低频繁切换导致的风控风险）
+            "scheduled_refresh_rotate_every_batches": int(
+                getattr(config.retry, "scheduled_refresh_rotate_every_batches", 1)
+            ),
             # 与后端调度器保持一致：内部固定最小批次，用于解释面板行为
             "scheduled_refresh_min_batch_size": 5,
         },

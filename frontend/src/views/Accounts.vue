@@ -885,20 +885,34 @@
                         </button>
                       </div>
 
-                      <div v-if="scheduledRefreshAdvancedEnabled" class="space-y-2">
-                        <label class="block text-xs text-muted-foreground">单轮最大入队账号数</label>
-                        <input
-                          v-model.number="scheduledRefreshMaxBatchSize"
-                          type="number"
-                          min="1"
-                          max="200"
-                          class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
-                        />
-                        <p class="text-xs text-muted-foreground">
-                          建议 10-30。后端每轮至少会保证最小批次（例如 5 个）以确保有进展；失败账号会指数退避一段时间。
-                        </p>
-                      </div>
-                    </div>
+	                      <div v-if="scheduledRefreshAdvancedEnabled" class="space-y-2">
+	                        <label class="block text-xs text-muted-foreground">单轮最大入队账号数</label>
+	                        <input
+	                          v-model.number="scheduledRefreshMaxBatchSize"
+	                          type="number"
+	                          min="1"
+	                          max="200"
+	                          class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
+	                        />
+	                        <p class="text-xs text-muted-foreground">
+	                          建议 10-30。后端每轮至少会保证最小批次（例如 5 个）以确保有进展；失败账号会指数退避一段时间。
+	                        </p>
+	                      </div>
+
+	                      <div v-if="scheduledRefreshAdvancedEnabled" class="space-y-2">
+	                        <label class="block text-xs text-muted-foreground">批次轮换间隔（完成多少个批次后切换节点）</label>
+	                        <input
+	                          v-model.number="scheduledRefreshRotateEveryBatches"
+	                          type="number"
+	                          min="0"
+	                          max="1000"
+	                          class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
+	                        />
+	                        <p class="text-xs text-muted-foreground">
+	                          0 表示禁用自动轮换；1 表示每个批次结束都切换一次；N 表示每完成 N 个批次切换一次。需在服务端设置 MIHOMO_SECRET 才会生效。
+	                        </p>
+	                      </div>
+	                    </div>
 
                     <div class="rounded-2xl border border-border bg-muted/30 px-4 py-3 text-xs text-muted-foreground">
                       <p class="mb-2 font-medium text-foreground">说明</p>
@@ -1428,13 +1442,19 @@ const lastRegisterTaskId = ref<string | null>(null)
 const lastLoginTaskId = ref<string | null>(null)
 const scheduledRefreshEnabled = ref(false)
 const scheduledRefreshInterval = ref(30)
-// 是否启用“高级自动刷新调度”（默认关闭，仅影响后台定时触发）
-const scheduledRefreshAdvancedEnabled = ref(false)
-// 高级调度：单轮最多入队账号数（后端仍会保证最小批次）
-const scheduledRefreshMaxBatchSize = ref(20)
-const refreshWindowHours = ref(24)
-const isLoadingScheduledConfig = ref(false)
-const isSavingScheduledConfig = ref(false)
+	// 是否启用“高级自动刷新调度”（默认关闭，仅影响后台定时触发）
+	const scheduledRefreshAdvancedEnabled = ref(false)
+	// 高级调度：单轮最多入队账号数（后端仍会保证最小批次）
+	const scheduledRefreshMaxBatchSize = ref(20)
+	// 自动轮换：完成多少个“批次任务”后切换一次代理节点（配合 mihomo controller）
+	// 说明：
+	// - 0：禁用自动轮换；
+	// - 1：每个批次结束都轮换一次（默认）；
+	// - N：每完成 N 个批次轮换一次。
+	const scheduledRefreshRotateEveryBatches = ref(1)
+	const refreshWindowHours = ref(24)
+	const isLoadingScheduledConfig = ref(false)
+	const isSavingScheduledConfig = ref(false)
 // 定时刷新调度状态（用于面板可视化）
 const scheduledRefreshStates = ref<ScheduledRefreshStateItem[]>([])
 const isLoadingScheduledRefreshStates = ref(false)
@@ -2376,14 +2396,15 @@ const loadScheduledConfig = async () => {
   isLoadingScheduledConfig.value = true
   try {
     const settings = await settingsApi.get()
-    cachedSettings.value = settings  // 缓存配置
-    scheduledRefreshEnabled.value = settings.retry.scheduled_refresh_enabled ?? false
-    scheduledRefreshInterval.value = settings.retry.scheduled_refresh_interval_minutes ?? 30
-    scheduledRefreshAdvancedEnabled.value = settings.retry.scheduled_refresh_advanced_enabled ?? false
-    scheduledRefreshMaxBatchSize.value = settings.retry.scheduled_refresh_max_batch_size ?? 20
-    refreshWindowHours.value = settings.basic.refresh_window_hours ?? 24
-    // 同步加载调度状态，便于用户保存配置后立即观察效果
-    await loadScheduledRefreshStates()
+	    cachedSettings.value = settings  // 缓存配置
+	    scheduledRefreshEnabled.value = settings.retry.scheduled_refresh_enabled ?? false
+	    scheduledRefreshInterval.value = settings.retry.scheduled_refresh_interval_minutes ?? 30
+	    scheduledRefreshAdvancedEnabled.value = settings.retry.scheduled_refresh_advanced_enabled ?? false
+	    scheduledRefreshMaxBatchSize.value = settings.retry.scheduled_refresh_max_batch_size ?? 20
+	    scheduledRefreshRotateEveryBatches.value = settings.retry.scheduled_refresh_rotate_every_batches ?? 1
+	    refreshWindowHours.value = settings.basic.refresh_window_hours ?? 24
+	    // 同步加载调度状态，便于用户保存配置后立即观察效果
+	    await loadScheduledRefreshStates()
   } catch (error: any) {
     toast.error(error?.message || '加载定时任务配置失败')
   } finally {
@@ -2412,30 +2433,43 @@ const saveScheduledConfig = async () => {
     return
   }
 
-  // 验证高级调度：单轮最大入队账号数（仅在开启高级调度时校验）
-  if (scheduledRefreshAdvancedEnabled.value) {
-    if (isNaN(scheduledRefreshMaxBatchSize.value) || !Number.isInteger(scheduledRefreshMaxBatchSize.value)) {
-      toast.error('单轮最大入队账号数必须是有效的整数')
-      return
-    }
-    if (scheduledRefreshMaxBatchSize.value < 1 || scheduledRefreshMaxBatchSize.value > 200) {
-      toast.error('单轮最大入队账号数必须在 1-200 之间')
-      return
-    }
-  }
+	  // 验证高级调度：单轮最大入队账号数（仅在开启高级调度时校验）
+	  if (scheduledRefreshAdvancedEnabled.value) {
+	    if (isNaN(scheduledRefreshMaxBatchSize.value) || !Number.isInteger(scheduledRefreshMaxBatchSize.value)) {
+	      toast.error('单轮最大入队账号数必须是有效的整数')
+	      return
+	    }
+	    if (scheduledRefreshMaxBatchSize.value < 1 || scheduledRefreshMaxBatchSize.value > 200) {
+	      toast.error('单轮最大入队账号数必须在 1-200 之间')
+	      return
+	    }
+	  }
+
+	  // 验证自动轮换：完成多少个批次后切换一次节点（仅在启用定时刷新时校验）
+	  if (scheduledRefreshEnabled.value) {
+	    if (isNaN(scheduledRefreshRotateEveryBatches.value) || !Number.isInteger(scheduledRefreshRotateEveryBatches.value)) {
+	      toast.error('批次轮换间隔必须是有效的整数')
+	      return
+	    }
+	    if (scheduledRefreshRotateEveryBatches.value < 0 || scheduledRefreshRotateEveryBatches.value > 1000) {
+	      toast.error('批次轮换间隔必须在 0-1000 之间（0 表示禁用自动轮换）')
+	      return
+	    }
+	  }
 
   isSavingScheduledConfig.value = true
   try {
     // 使用缓存的配置，避免重复API调用
-    const settings = cachedSettings.value || await settingsApi.get()
-    settings.retry.scheduled_refresh_enabled = scheduledRefreshEnabled.value
-    settings.retry.scheduled_refresh_interval_minutes = scheduledRefreshInterval.value
-    settings.retry.scheduled_refresh_advanced_enabled = scheduledRefreshAdvancedEnabled.value
-    settings.retry.scheduled_refresh_max_batch_size = scheduledRefreshMaxBatchSize.value
-    settings.basic.refresh_window_hours = refreshWindowHours.value
-    await settingsApi.update(settings)
-    cachedSettings.value = settings  // 更新缓存
-    toast.success('定时任务配置已保存')
+	    const settings = cachedSettings.value || await settingsApi.get()
+	    settings.retry.scheduled_refresh_enabled = scheduledRefreshEnabled.value
+	    settings.retry.scheduled_refresh_interval_minutes = scheduledRefreshInterval.value
+	    settings.retry.scheduled_refresh_advanced_enabled = scheduledRefreshAdvancedEnabled.value
+	    settings.retry.scheduled_refresh_max_batch_size = scheduledRefreshMaxBatchSize.value
+	    settings.retry.scheduled_refresh_rotate_every_batches = scheduledRefreshRotateEveryBatches.value
+	    settings.basic.refresh_window_hours = refreshWindowHours.value
+	    await settingsApi.update(settings)
+	    cachedSettings.value = settings  // 更新缓存
+	    toast.success('定时任务配置已保存')
     // 保存后刷新一次调度状态，便于立刻观察 next_eligible_at / 连续失败等变化
     await loadScheduledRefreshStates()
   } catch (error: any) {

@@ -70,6 +70,12 @@ class LoginService(BaseTaskService[LoginTask]):
         # 记录上一次“定时调度器”决策时间，便于观测跳过原因与节奏
         self._last_scheduled_tick_at: Optional[float] = None
         self._last_scheduled_enqueue_at: Optional[float] = None
+        # mihomo 轮换相关的运行时状态（仅内存保存，重启后重置）
+        # 说明：
+        # - _mihomo_scheduled_batches_since_rotate：已完成的“自动定时刷新批次”计数，用于实现“每 N 批次切换一次”；
+        # - _mihomo_secret_missing_warned：避免在未配置 MIHOMO_SECRET 时每个批次都刷屏日志。
+        self._mihomo_scheduled_batches_since_rotate: int = 0
+        self._mihomo_secret_missing_warned: bool = False
 
     def _get_running_task(self) -> Optional[LoginTask]:
         """
@@ -278,10 +284,32 @@ class LoginService(BaseTaskService[LoginTask]):
             if task.status == TaskStatus.CANCELLED:
                 return
 
+            # 前端可配置：完成多少个批次后切换一次（默认 1，即每批次都切换）。
+            # 说明：
+            # - 该配置属于“业务侧节奏控制”，放在 retry 配置里便于在管理面板调整；
+            # - 0 表示禁用自动轮换；
+            # - N>0 表示每完成 N 个 scheduled 批次后轮换一次。
+            rotate_every_raw = getattr(config.retry, "scheduled_refresh_rotate_every_batches", 1)
+            try:
+                rotate_every = int(rotate_every_raw)
+            except Exception:
+                rotate_every = 1
+            rotate_every = max(rotate_every, 0)
+            if rotate_every == 0:
+                return
+
             secret = str(os.environ.get("MIHOMO_SECRET") or "").strip()
             if not secret:
                 # 未配置密钥说明用户不希望启用该能力；保持静默或轻量提示即可。
-                self._append_log(task, "info", "[MIHOMO] 未配置 MIHOMO_SECRET，跳过批次结束自动切换节点")
+                if not self._mihomo_secret_missing_warned:
+                    self._append_log(task, "info", "[MIHOMO] 未配置 MIHOMO_SECRET，跳过批次结束自动切换节点")
+                    self._mihomo_secret_missing_warned = True
+                return
+
+            # 有密钥说明用户期望启用该能力：开始按批次计数。
+            self._mihomo_scheduled_batches_since_rotate += 1
+            if self._mihomo_scheduled_batches_since_rotate < rotate_every:
+                # 未达到轮换阈值：本批次结束不切换（保持出口稳定）。
                 return
 
             controller = str(os.environ.get("MIHOMO_CONTROLLER") or "http://127.0.0.1:9090").strip()
@@ -322,7 +350,8 @@ class LoginService(BaseTaskService[LoginTask]):
             self._append_log(
                 task,
                 "info",
-                f"[MIHOMO] 批次结束准备轮换: group={group}, now={snapshot.now or '(unknown)'}, candidates={len(snapshot.all)}",
+                f"[MIHOMO] 批次结束准备轮换: group={group}, now={snapshot.now or '(unknown)'}, "
+                f"candidates={len(snapshot.all)}, rotate_every_batches={rotate_every}",
             )
 
             # 尝试一圈：找到第一个 delay 可用的节点后切换；否则保持不变。
@@ -334,6 +363,8 @@ class LoginService(BaseTaskService[LoginTask]):
                     continue
 
                 await client.select_proxy(group_name=group, proxy_name=candidate)
+                # 切换成功：重置计数，等待下一轮累计到阈值再切换。
+                self._mihomo_scheduled_batches_since_rotate = 0
                 self._append_log(
                     task,
                     "info",
