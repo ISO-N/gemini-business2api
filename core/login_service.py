@@ -15,6 +15,7 @@ from core.mail_providers import create_temp_mail_client
 from core.gemini_automation import GeminiAutomation
 from core.gemini_automation_uc import GeminiAutomationUC
 from core.microsoft_mail_client import MicrosoftMailClient
+from core.mihomo_controller import MihomoControllerClient
 
 logger = logging.getLogger("gemini.login")
 
@@ -245,6 +246,106 @@ class LoginService(BaseTaskService[LoginTask]):
         backoff = SCHEDULED_REFRESH_BACKOFF_BASE_SECONDS * (2 ** (n - 1))
         return int(min(backoff, SCHEDULED_REFRESH_BACKOFF_MAX_SECONDS))
 
+    async def _rotate_mihomo_proxy_best_effort(self, task: LoginTask) -> None:
+        """
+        在“自动定时刷新批次（scheduled）”完成后，按顺序轮换 mihomo 的节点（尽力而为）。
+
+        设计目标：
+        - 项目侧代理入口保持不变（例如 proxy_for_auth 固定指向 http://127.0.0.1:7890）；
+        - 每批（一个 LoginTask）结束后，调用 mihomo controller 将策略组切到“下一个可用节点”；
+        - 切换前对候选节点做 delay 探测，避免切到明显不可用的节点；
+        - 出现任何异常都不影响刷新主流程（只记录日志并返回）。
+
+        依赖环境变量（建议只在本地/自部署环境开启）：
+        - MIHOMO_CONTROLLER: controller 地址，默认 "http://127.0.0.1:9090"
+        - MIHOMO_SECRET: controller 密钥（必填；未配置则跳过切换）
+        - MIHOMO_GROUP: 轮换的策略组名，默认 "NCloud"
+        - MIHOMO_TEST_URL: delay 测试 URL，默认 "http://www.gstatic.com/generate_204"
+        - MIHOMO_TEST_TIMEOUT_MS: delay 测试超时（毫秒），默认 8000
+        - MIHOMO_CONTROLLER_TIMEOUT_SECONDS: controller 请求超时（秒），默认 3.0
+
+        参数：
+        - task: 当前刷新任务（用于记录日志）
+
+        返回值：
+        - None
+        """
+        try:
+            # 仅对“自动定时刷新”生效，手动刷新不切换，避免用户操作被打断。
+            if (task.trigger or "").strip().lower() != "scheduled":
+                return
+            # 取消任务不切换：避免在不完整批次时轮换导致行为不一致。
+            if task.status == TaskStatus.CANCELLED:
+                return
+
+            secret = str(os.environ.get("MIHOMO_SECRET") or "").strip()
+            if not secret:
+                # 未配置密钥说明用户不希望启用该能力；保持静默或轻量提示即可。
+                self._append_log(task, "info", "[MIHOMO] 未配置 MIHOMO_SECRET，跳过批次结束自动切换节点")
+                return
+
+            controller = str(os.environ.get("MIHOMO_CONTROLLER") or "http://127.0.0.1:9090").strip()
+            group = str(os.environ.get("MIHOMO_GROUP") or "NCloud").strip()
+            test_url = str(os.environ.get("MIHOMO_TEST_URL") or "http://www.gstatic.com/generate_204").strip()
+
+            timeout_ms_raw = os.environ.get("MIHOMO_TEST_TIMEOUT_MS") or "8000"
+            try:
+                timeout_ms = int(timeout_ms_raw)
+            except Exception:
+                timeout_ms = 8000
+            timeout_ms = max(timeout_ms, 1000)
+
+            ctl_timeout_raw = os.environ.get("MIHOMO_CONTROLLER_TIMEOUT_SECONDS") or "3"
+            try:
+                ctl_timeout_seconds = float(ctl_timeout_raw)
+            except Exception:
+                ctl_timeout_seconds = 3.0
+            ctl_timeout_seconds = max(ctl_timeout_seconds, 0.5)
+
+            client = MihomoControllerClient(
+                controller_base_url=controller,
+                secret=secret,
+                timeout_seconds=ctl_timeout_seconds,
+            )
+
+            snapshot = await client.get_proxy_group(group)
+            if not snapshot.all:
+                self._append_log(task, "warning", f"[MIHOMO] 策略组候选为空，无法轮换: group={group}")
+                return
+
+            # 按“配置出现顺序”轮换：从当前 now 的下一个开始遍历；若 now 不在列表中，从头开始。
+            try:
+                current_index = snapshot.all.index(snapshot.now)
+            except Exception:
+                current_index = -1
+
+            self._append_log(
+                task,
+                "info",
+                f"[MIHOMO] 批次结束准备轮换: group={group}, now={snapshot.now or '(unknown)'}, candidates={len(snapshot.all)}",
+            )
+
+            # 尝试一圈：找到第一个 delay 可用的节点后切换；否则保持不变。
+            for step in range(1, len(snapshot.all) + 1):
+                candidate = snapshot.all[(current_index + step) % len(snapshot.all)]
+                delay_ms = await client.test_delay_ms(candidate, test_url=test_url, timeout_ms=timeout_ms)
+                if delay_ms is None:
+                    self._append_log(task, "warning", f"[MIHOMO] 候选节点不可用，跳过: {candidate}")
+                    continue
+
+                await client.select_proxy(group_name=group, proxy_name=candidate)
+                self._append_log(
+                    task,
+                    "info",
+                    f"[MIHOMO] 已切换到下一个节点: {candidate} (delay={delay_ms}ms, test_url={test_url})",
+                )
+                return
+
+            self._append_log(task, "warning", "[MIHOMO] 未找到可用候选节点，本批次结束不切换（保持当前不变）")
+        except Exception as exc:
+            # 任何异常都不应影响主刷新流程（只记录日志与警告）。
+            self._append_log(task, "warning", f"[MIHOMO] 自动切换节点异常，已忽略: {type(exc).__name__}: {str(exc)[:200]}")
+
     def _update_scheduled_refresh_state_sync(
         self,
         account_id: str,
@@ -401,10 +502,16 @@ class LoginService(BaseTaskService[LoginTask]):
                     f"consecutive_failures={new_state.get('consecutive_failures')})",
                 )
 
+        # 先计算任务最终状态（轮换逻辑会基于 status/trigger 判断是否执行）。
         if task.cancel_requested:
             task.status = TaskStatus.CANCELLED
         else:
             task.status = TaskStatus.SUCCESS if task.fail_count == 0 else TaskStatus.FAILED
+
+        # 自动定时刷新（scheduled）批次结束后：轮换 mihomo 节点（不影响手动刷新）。
+        # 说明：轮换发生在任务真正结束之前，便于在同一任务日志中完整记录“批次结束→切换结果”。
+        await self._rotate_mihomo_proxy_best_effort(task)
+
         task.finished_at = time.time()
         self._append_log(task, "info", f"login task finished ({task.success_count}/{len(task.account_ids)})")
         self._current_task_id = None
