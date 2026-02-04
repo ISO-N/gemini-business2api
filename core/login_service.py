@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -27,6 +29,12 @@ SCHEDULED_REFRESH_DEFAULT_SERVICE_SECONDS = 60.0  # HRRN 默认服务时间（�
 SCHEDULED_REFRESH_AVG_ALPHA = 0.2  # 平均耗时滑动系数（EMA），越大越重视最近一次
 SCHEDULED_REFRESH_BACKOFF_BASE_SECONDS = 15 * 60  # 指数退避基准（15分钟）
 SCHEDULED_REFRESH_BACKOFF_MAX_SECONDS = 12 * 60 * 60  # 指数退避上限（12小时）
+# mihomo 节点累计成功数统计文件（个人自用：用于筛选“更稳定/更高成功率”的节点）。
+# 说明：
+# - 仅在 scheduled 批次触发；
+# - 仅统计节点名（mihomo 策略组 now）→ 累计刷新成功数；
+# - 文件放在 data/ 下，属于运行态数据，不应提交到仓库。
+MIHOMO_NODE_SUCCESS_TOTALS_JSON_PATH = os.path.join("data", "mihomo_node_success_totals.json")
 
 
 @dataclass
@@ -76,6 +84,88 @@ class LoginService(BaseTaskService[LoginTask]):
         # - _mihomo_secret_missing_warned：避免在未配置 MIHOMO_SECRET 时每个批次都刷屏日志。
         self._mihomo_scheduled_batches_since_rotate: int = 0
         self._mihomo_secret_missing_warned: bool = False
+        # mihomo 节点统计相关运行时状态（仅内存保存，重启后重置）
+        # 说明：
+        # - _mihomo_cached_now_node：缓存当前策略组 now 节点名，供“每批次统计”复用，避免频繁请求 controller；
+        # - _mihomo_node_success_totals_lock：保护 JSON 文件读写，避免并发写入造成文件损坏。
+        self._mihomo_cached_now_node: Optional[str] = None
+        self._mihomo_node_success_totals_lock = threading.Lock()
+
+    def _update_mihomo_node_success_totals_sync(self, node_name: str, add_success_count: int) -> Optional[int]:
+        """
+        同步更新“mihomo 节点累计刷新成功数”JSON 文件（供 asyncio.to_thread 调用）。
+
+        功能说明：
+        - 将本批次（scheduled）的刷新成功数累加到指定节点（mihomo_now）名下；
+        - 该统计用于个人自用筛选“更好的节点/出口 IP”，不影响业务逻辑；
+        - 采用“原子写入（临时文件 + os.replace）”避免进程异常时写坏文件；
+        - 异常场景直接返回 None，由调用方决定是否记录日志（best effort）。
+
+        参数：
+        - node_name: mihomo 策略组当前选中节点名（snapshot.now）
+        - add_success_count: 本批次要累加的成功数（通常为 task.success_count）
+
+        返回值：
+        - Optional[int]: 更新后的累计成功数；若参数无效或写入失败则返回 None
+        """
+        name = str(node_name or "").strip()
+        try:
+            inc = int(add_success_count or 0)
+        except Exception:
+            inc = 0
+
+        # 节点名为空或无需累加时直接跳过（避免写入无意义数据）。
+        if not name or inc <= 0:
+            return None
+
+        # 确保 data/ 目录存在（运行态目录，通常由用户挂载或启动时创建）。
+        try:
+            os.makedirs(os.path.dirname(MIHOMO_NODE_SUCCESS_TOTALS_JSON_PATH), exist_ok=True)
+        except Exception:
+            return None
+
+        with self._mihomo_node_success_totals_lock:
+            totals: Dict[str, int] = {}
+            try:
+                if os.path.exists(MIHOMO_NODE_SUCCESS_TOTALS_JSON_PATH):
+                    with open(MIHOMO_NODE_SUCCESS_TOTALS_JSON_PATH, "r", encoding="utf-8") as f:
+                        raw = (f.read() or "").strip()
+                    if raw:
+                        loaded = json.loads(raw)
+                        if isinstance(loaded, dict):
+                            # 只接受“字符串 → 数字”的结构，其它内容忽略（避免污染/破坏格式）。
+                            for k, v in loaded.items():
+                                key = str(k or "").strip()
+                                if not key:
+                                    continue
+                                try:
+                                    totals[key] = int(v or 0)
+                                except Exception:
+                                    totals[key] = 0
+            except Exception:
+                # 读取/解析失败：视为无历史统计，从空字典开始写入。
+                totals = {}
+
+            current = int(totals.get(name, 0) or 0)
+            new_total = current + inc
+            totals[name] = new_total
+
+            # 原子写入：先写临时文件，再 replace 覆盖目标文件。
+            tmp_path = f"{MIHOMO_NODE_SUCCESS_TOTALS_JSON_PATH}.tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(totals, f, ensure_ascii=False, indent=2, sort_keys=True)
+                os.replace(tmp_path, MIHOMO_NODE_SUCCESS_TOTALS_JSON_PATH)
+            except Exception:
+                # 写入失败时尽力清理临时文件，避免残留影响下次读取。
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                return None
+
+            return new_total
 
     def _get_running_task(self) -> Optional[LoginTask]:
         """
@@ -269,6 +359,9 @@ class LoginService(BaseTaskService[LoginTask]):
         - MIHOMO_TEST_URL: delay 测试 URL，默认 "http://www.gstatic.com/generate_204"
         - MIHOMO_TEST_TIMEOUT_MS: delay 测试超时（毫秒），默认 8000
         - MIHOMO_CONTROLLER_TIMEOUT_SECONDS: controller 请求超时（秒），默认 3.0
+        - 统计文件（个人自用）：
+          - 在可获取到 mihomo_now 的前提下，将“本批次成功刷新数”累加到 `data/mihomo_node_success_totals.json`，
+            用于筛选更稳定的节点（best effort，不影响主流程）。
 
         参数：
         - task: 当前刷新任务（用于记录日志）
@@ -307,21 +400,15 @@ class LoginService(BaseTaskService[LoginTask]):
                 return
 
             # 有密钥说明用户期望启用该能力：开始按批次计数。
+            # 说明：
+            # - 计数用于控制“每 N 批次切换一次”的节奏；
+            # - 统计（个人自用）不依赖是否达到轮换阈值：只要能确定当前 now 节点名，就可累加成功数。
             self._mihomo_scheduled_batches_since_rotate += 1
-            if self._mihomo_scheduled_batches_since_rotate < rotate_every:
-                # 未达到轮换阈值：本批次结束不切换（保持出口稳定）。
-                return
+            should_rotate = self._mihomo_scheduled_batches_since_rotate >= rotate_every
 
+            # controller 基础配置（统计与轮换都会用到）。
             controller = str(os.environ.get("MIHOMO_CONTROLLER") or "http://127.0.0.1:9090").strip()
             group = str(os.environ.get("MIHOMO_GROUP") or "NCloud").strip()
-            test_url = str(os.environ.get("MIHOMO_TEST_URL") or "http://www.gstatic.com/generate_204").strip()
-
-            timeout_ms_raw = os.environ.get("MIHOMO_TEST_TIMEOUT_MS") or "8000"
-            try:
-                timeout_ms = int(timeout_ms_raw)
-            except Exception:
-                timeout_ms = 8000
-            timeout_ms = max(timeout_ms, 1000)
 
             ctl_timeout_raw = os.environ.get("MIHOMO_CONTROLLER_TIMEOUT_SECONDS") or "3"
             try:
@@ -336,7 +423,62 @@ class LoginService(BaseTaskService[LoginTask]):
                 timeout_seconds=ctl_timeout_seconds,
             )
 
-            snapshot = await client.get_proxy_group(group)
+            # --- 个人自用统计：节点名（mihomo_now）→ 累计成功数（本批次） ---
+            # 关键点：
+            # - “本批次执行时”的节点名应为切换前的 now；
+            # - rotate_every>1 时，本函数可能不会每批都轮换；为避免每批都请求 controller，
+            #   这里优先使用缓存节点名；缓存为空时再向 controller 取一次以初始化。
+            snapshot: Optional[Any] = None
+            now_node = str(self._mihomo_cached_now_node or "").strip()
+            if not now_node:
+                try:
+                    snapshot = await client.get_proxy_group(group)
+                    now_node = str(snapshot.now or "").strip()
+                    if now_node:
+                        self._mihomo_cached_now_node = now_node
+                except Exception:
+                    snapshot = None
+                    now_node = ""
+
+            if now_node and int(task.success_count or 0) > 0:
+                new_total = await asyncio.to_thread(
+                    self._update_mihomo_node_success_totals_sync,
+                    now_node,
+                    int(task.success_count or 0),
+                )
+                if new_total is not None:
+                    self._append_log(
+                        task,
+                        "info",
+                        f"[MIHOMO][STATS] 节点累计成功数已更新: node={now_node}, +{int(task.success_count or 0)}, total={new_total}",
+                    )
+
+            if not should_rotate:
+                # 未达到轮换阈值：本批次结束不切换（保持出口稳定）。
+                return
+
+            # 轮换需要最新快照：若上面为初始化缓存已获取过 snapshot，可复用，否则再取一次。
+            if snapshot is None:
+                snapshot = await client.get_proxy_group(group)
+
+            # 每次真正尝试轮换时，同步更新缓存为 controller 当前 now（避免外部切换导致缓存偏差）。
+            try:
+                snapshot_now = str(snapshot.now or "").strip()
+                if snapshot_now:
+                    self._mihomo_cached_now_node = snapshot_now
+            except Exception:
+                pass
+
+            # 轮换相关配置（仅在达到阈值时才读取并执行，减少不必要的额外开销）。
+            test_url = str(os.environ.get("MIHOMO_TEST_URL") or "http://www.gstatic.com/generate_204").strip()
+
+            timeout_ms_raw = os.environ.get("MIHOMO_TEST_TIMEOUT_MS") or "8000"
+            try:
+                timeout_ms = int(timeout_ms_raw)
+            except Exception:
+                timeout_ms = 8000
+            timeout_ms = max(timeout_ms, 1000)
+
             if not snapshot.all:
                 self._append_log(task, "warning", f"[MIHOMO] 策略组候选为空，无法轮换: group={group}")
                 return
@@ -365,6 +507,8 @@ class LoginService(BaseTaskService[LoginTask]):
                 await client.select_proxy(group_name=group, proxy_name=candidate)
                 # 切换成功：重置计数，等待下一轮累计到阈值再切换。
                 self._mihomo_scheduled_batches_since_rotate = 0
+                # 切换成功后更新缓存，使后续批次统计能直接使用最新节点名。
+                self._mihomo_cached_now_node = str(candidate or "").strip() or self._mihomo_cached_now_node
                 self._append_log(
                     task,
                     "info",
