@@ -1043,7 +1043,12 @@ async def save_account_cooldown_state(account_id: str, account_mgr: AccountManag
             "failure_count": account_mgr.failure_count,
         }
 
-        success = await storage.update_account_cooldown(account_id, cooldown_data)
+        # 关键说明：
+        # - core/storage.py 为了兼容同步调用，内部维护了独立的数据库事件循环（storage-db-loop）；
+        # - 若在主事件循环中直接 await storage.update_account_cooldown（asyncpg pool 可能已在 db-loop 中初始化），
+        #   会触发 “Future attached to a different loop” 之类的跨事件循环错误；
+        # - 因此这里统一通过 sync 包装（在 db-loop 中执行）+ asyncio.to_thread 方式调用，避免阻塞主事件循环。
+        success = await asyncio.to_thread(storage.update_account_cooldown_sync, account_id, cooldown_data)
         if success:
             logger.debug(f"[COOLDOWN] 账户 {account_id} 冷却状态已保存")
         else:
@@ -1093,11 +1098,16 @@ async def save_all_cooldown_states(multi_account_mgr: MultiAccountManager) -> in
         logger.info(f"[COOLDOWN] 无需保存：所有账户无冷却状态")
         return 0
 
-    success_count, missing = await storage.bulk_update_accounts_cooldown(updates)
+    # 关键说明：
+    # - 原实现直接 await storage.bulk_update_accounts_cooldown（异步）在部分部署下会出现：
+    #   1) Future attached to a different loop（asyncpg pool 在不同事件循环初始化）
+    #   2) cannot perform operation: another operation is in progress（跨 loop/并发导致连接状态异常）
+    # - 这里改为：通过 storage.bulk_update_accounts_cooldown_sync（在 storage-db-loop 中执行）并使用 asyncio.to_thread 调用，
+    #   保证不会阻塞主事件循环，也避免跨事件循环使用同一个 asyncpg pool。
+    success_count, missing = await asyncio.to_thread(storage.bulk_update_accounts_cooldown_sync, updates)
 
     if missing:
         logger.warning(f"[COOLDOWN] {len(missing)} 个账户不存在: {missing[:5]}")
 
     logger.info(f"[COOLDOWN] 批量保存冷却状态: {success_count}/{len(updates)} 个账户（跳过 {len(multi_account_mgr.accounts) - len(updates)} 个无状态账户）")
     return success_count
-
