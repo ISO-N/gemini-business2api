@@ -91,12 +91,6 @@
             <div class="rounded-2xl border border-border bg-card p-4">
               <p class="text-xs uppercase tracking-[0.3em] text-muted-foreground">重试</p>
               <div class="mt-4 grid grid-cols-2 gap-3 text-sm">
-                <label class="col-span-2 text-xs text-muted-foreground">新会话尝试次数</label>
-                <input v-model.number="localSettings.retry.max_new_session_tries" type="number" min="1" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
-
-                <label class="col-span-2 text-xs text-muted-foreground">请求重试次数</label>
-                <input v-model.number="localSettings.retry.max_request_retries" type="number" min="0" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
-
                 <label class="col-span-2 text-xs text-muted-foreground">账户切换次数</label>
                 <input v-model.number="localSettings.retry.max_account_switch_tries" type="number" min="1" class="col-span-2 rounded-2xl border border-input bg-background px-3 py-2" />
 

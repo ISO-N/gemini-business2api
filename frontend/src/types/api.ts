@@ -98,8 +98,6 @@ export interface Settings {
     register_domain?: string
   }
   retry: {
-    max_new_session_tries: number
-    max_request_retries: number
     max_account_switch_tries: number
     account_failure_threshold: number
     text_rate_limit_cooldown_seconds: number

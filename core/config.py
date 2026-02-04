@@ -95,8 +95,6 @@ class VideoGenerationConfig(BaseModel):
 
 class RetryConfig(BaseModel):
     """重试策略配置"""
-    max_new_session_tries: int = Field(default=5, ge=1, le=20, description="新会话尝试账户数")
-    max_request_retries: int = Field(default=3, ge=1, le=10, description="请求失败重试次数")
     max_account_switch_tries: int = Field(default=5, ge=1, le=20, description="账户切换尝试次数")
     rate_limit_cooldown_seconds: int = Field(default=7200, ge=3600, le=43200, description="429冷却时间（秒）")
     text_rate_limit_cooldown_seconds: int = Field(default=7200, ge=3600, le=86400, description="对话配额冷却（秒）")
@@ -224,8 +222,8 @@ class ConfigManager:
             duckmail_base_url=basic_data.get("duckmail_base_url") or "https://api.duckmail.sbs",
             duckmail_api_key=str(duckmail_api_key_raw or "").strip(),
             duckmail_verify_ssl=_parse_bool(basic_data.get("duckmail_verify_ssl"), True),
-            temp_mail_provider=basic_data.get("temp_mail_provider") or "duckmail",
-            moemail_base_url=basic_data.get("moemail_base_url") or "https://moemail.app",
+            temp_mail_provider=basic_data.get("temp_mail_provider") or "moemail",
+            moemail_base_url=basic_data.get("moemail_base_url") or "https://moemail.nanohajimi.mom",
             moemail_api_key=str(basic_data.get("moemail_api_key") or "").strip(),
             moemail_domain=str(basic_data.get("moemail_domain") or "").strip(),
             freemail_base_url=basic_data.get("freemail_base_url") or "http://your-freemail-server.com",
@@ -458,24 +456,9 @@ class ConfigManager:
         return self._config.session.expire_hours
 
     @property
-    def max_new_session_tries(self) -> int:
-        """新会话尝试账户数"""
-        return self._config.retry.max_new_session_tries
-
-    @property
-    def max_request_retries(self) -> int:
-        """请求失败重试次数"""
-        return self._config.retry.max_request_retries
-
-    @property
     def max_account_switch_tries(self) -> int:
         """账户切换尝试次数"""
         return self._config.retry.max_account_switch_tries
-
-    @property
-    def account_failure_threshold(self) -> int:
-        """账户失败阈值"""
-        return self._config.retry.account_failure_threshold
 
     @property
     def rate_limit_cooldown_seconds(self) -> int:

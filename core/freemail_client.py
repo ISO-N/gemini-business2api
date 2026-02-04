@@ -154,17 +154,39 @@ class FreemailClient:
                                 email_time = datetime.fromisoformat(created_at.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
 
                             if email_time < since_time:
+                                self._log("info", f"⏭️ 邮件 {idx} 时间过早，跳过")
                                 continue
                         except Exception:
                             pass
 
-                # 提取验证码
-                content = email_data.get("content") or ""
-                subject = email_data.get("subject") or ""
-                html_content = email_data.get("html_content") or ""
-                preview = email_data.get("preview") or ""
+                # 获取邮件完整内容
+                email_id = email_data.get("id")
+                if email_id:
+                    # 调用详情接口获取完整内容
+                    detail_res = self._request(
+                        "GET",
+                        f"{self.base_url}/api/email/{email_id}",
+                        params={"admin_token": self.jwt_token},
+                    )
+                    if detail_res.status_code == 200:
+                        detail_data = detail_res.json()
+                        content = detail_data.get("content") or ""
+                        html_content = detail_data.get("html_content") or ""
+                    else:
+                        # 降级：如果详情接口失败，使用列表中的字段
+                        content = email_data.get("content") or ""
+                        html_content = email_data.get("html_content") or ""
+                        preview = email_data.get("preview") or ""
+                        content = content + " " + preview
+                else:
+                    # 降级：没有 ID，使用列表中的字段
+                    content = email_data.get("content") or ""
+                    html_content = email_data.get("html_content") or ""
+                    preview = email_data.get("preview") or ""
+                    content = content + " " + preview
 
-                full_content = subject + " " + content + " " + html_content + " " + preview
+                subject = email_data.get("subject") or ""
+                full_content = subject + " " + content + " " + html_content
                 code = extract_verification_code(full_content)
                 if code:
                     self._log("info", f"✅ 找到验证码: {code}")

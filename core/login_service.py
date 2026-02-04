@@ -685,6 +685,16 @@ class LoginService(BaseTaskService[LoginTask]):
                 break
 
         self._apply_accounts_update(accounts)
+
+        # 清除该账户的所有冷却状态（重新登录后恢复可用）
+        if account_id in self.multi_account_mgr.accounts:
+            account_mgr = self.multi_account_mgr.accounts[account_id]
+            account_mgr.quota_cooldowns.clear()  # 清除配额冷却
+            account_mgr.generic_cooldown_until = 0.0  # 清除通用冷却
+            account_mgr.permanently_disabled = False  # 清除永久禁用
+            account_mgr.is_available = True  # 恢复可用状态
+            log_cb("info", "✅ 已清除账户冷却状态")
+
         log_cb("info", "✅ 配置已保存到数据库")
         return {"success": True, "email": account_id, "config": config_data}
 

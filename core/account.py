@@ -144,30 +144,28 @@ class AccountManager:
         self.is_available = True
         self.last_error_time = 0.0  # 保留用于统计
         self.quota_cooldowns: Dict[str, float] = {}  # 按配额类型的冷却时间戳
+        self.generic_cooldown_until: float = 0.0  # 通用冷却截止时间（用于 502/504/其他错误）
+        self.permanently_disabled: bool = False  # 永久禁用标记（401/403）
         self.conversation_count = 0  # 累计成功次数（用于统计展示）
         self.failure_count = 0  # 累计失败次数（用于统计展示）
         self.session_usage_count = 0  # 本次启动后使用次数（用于均衡轮询）
 
     def handle_non_http_error(self, error_context: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
         """
-        统一处理非HTTP错误（网络错误、解析错误等）- 简化版：只有配额冷却
+        统一处理非HTTP错误（网络错误、解析错误等）- 通用冷却
 
         Args:
             error_context: 错误上下文（如"JWT获取"、"聊天请求"）
             request_id: 请求ID（用于日志）
-            quota_type: 配额类型（"text", "images", "videos"），用于按类型冷却
+            quota_type: 配额类型（保留参数，兼容性）
         """
         req_tag = f"[req_{request_id}] " if request_id else ""
 
-        # 如果没有指定配额类型，默认冷却对话配额（因为对话是基础）
-        if not quota_type or quota_type not in QUOTA_TYPES:
-            quota_type = "text"
-
-        self.quota_cooldowns[quota_type] = time.time()
-        cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
+        # 非HTTP错误：通用冷却 3600 秒（1小时）
+        self.generic_cooldown_until = time.time() + 3600
         logger.warning(
             f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-            f"{error_context}失败，{QUOTA_TYPES[quota_type]}配额将休息{cooldown_seconds}秒后自动恢复"
+            f"{error_context}失败，账户将休息3600秒（1小时）后自动恢复"
         )
 
     def _get_quota_cooldown_seconds(self, quota_type: Optional[str]) -> int:
@@ -186,17 +184,19 @@ class AccountManager:
 
     def handle_http_error(self, status_code: int, error_detail: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
         """
-        统一处理HTTP错误 - 简化版：只有配额冷却
+        统一处理HTTP错误 - 按错误类型分类冷却
 
         Args:
             status_code: HTTP状态码
             error_detail: 错误详情
             request_id: 请求ID（用于日志）
-            quota_type: 配额类型（"text", "images", "videos"），用于按类型冷却
+            quota_type: 配额类型（"text", "images", "videos"），用于 429 按类型冷却
 
         处理逻辑：
             - 400: 参数错误，不计入失败（客户端问题）
-            - 所有其他错误: 按配额类型冷却（默认为对话配额）
+            - 401/403: 永久冷却（认证错误，需要手动处理）
+            - 429: 按配额类型冷却（配额耗尽）
+            - 502/504/其他: 通用冷却 3600 秒（1小时）
         """
         req_tag = f"[req_{request_id}] " if request_id else ""
 
@@ -208,17 +208,38 @@ class AccountManager:
             )
             return
 
-        # 所有其他错误：按配额类型冷却（默认为对话配额）
-        # 如果没有指定配额类型，默认冷却对话配额（因为对话是基础）
-        if not quota_type or quota_type not in QUOTA_TYPES:
-            quota_type = "text"
+        # 401/403认证错误：永久冷却
+        if status_code in (401, 403):
+            self.permanently_disabled = True
+            self.is_available = False
+            error_type = HTTP_ERROR_NAMES.get(status_code, f"HTTP {status_code}")
+            logger.error(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"遇到{error_type}认证错误，账户已永久禁用（需要手动处理）"
+                f"{': ' + error_detail[:100] if error_detail else ''}"
+            )
+            return
 
-        self.quota_cooldowns[quota_type] = time.time()
-        cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
+        # 429配额错误：按类型冷却
+        if status_code == 429:
+            if not quota_type or quota_type not in QUOTA_TYPES:
+                quota_type = "text"
+
+            self.quota_cooldowns[quota_type] = time.time()
+            cooldown_seconds = self._get_quota_cooldown_seconds(quota_type)
+            logger.warning(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"遇到429配额错误，{QUOTA_TYPES[quota_type]}配额将休息{cooldown_seconds}秒后自动恢复"
+                f"{': ' + error_detail[:100] if error_detail else ''}"
+            )
+            return
+
+        # 502/504/其他错误：通用冷却 3600 秒（1小时）
+        self.generic_cooldown_until = time.time() + 3600
         error_type = HTTP_ERROR_NAMES.get(status_code, f"HTTP {status_code}")
         logger.warning(
             f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-            f"遇到{error_type}错误，{QUOTA_TYPES[quota_type]}配额将休息{cooldown_seconds}秒后自动恢复"
+            f"遇到{error_type}错误，账户将休息3600秒（1小时）后自动恢复"
             f"{': ' + error_detail[:100] if error_detail else ''}"
         )
 
@@ -244,18 +265,33 @@ class AccountManager:
         """
         检查多个配额类型是否都可用。
 
-        注意：如果对话配额受限，所有配额都不可用（对话是基础功能）
+        检查顺序：
+            1. 永久禁用检查
+            2. 通用冷却检查
+            3. 对话配额检查（基础功能）
+            4. 其他配额检查
         """
+        # 1. 永久禁用检查
+        if self.permanently_disabled:
+            return False
+
+        # 2. 通用冷却检查
+        if self.generic_cooldown_until > 0:
+            if time.time() < self.generic_cooldown_until:
+                return False
+            # 冷却已过期，清理
+            self.generic_cooldown_until = 0.0
+
         if not quota_types:
             return True
         if isinstance(quota_types, str):
             quota_types = [quota_types]
 
-        # 如果对话配额受限，所有配额都不可用
+        # 3. 如果对话配额受限，所有配额都不可用
         if not self.is_quota_available("text"):
             return False
 
-        # 检查其他配额
+        # 4. 检查其他配额
         return all(self.is_quota_available(qt) for qt in quota_types if qt != "text")
 
     async def get_jwt(self, request_id: str = "") -> str:
@@ -522,7 +558,43 @@ class MultiAccountManager:
             manager.failure_count = global_stats["account_failures"].get(config.account_id, 0)
         self.accounts[config.account_id] = manager
         self.account_list.append(config.account_id)
-        logger.info(f"[MULTI] [ACCOUNT] 添加账户: {config.account_id}")
+        logger.debug(f"[MULTI] [ACCOUNT] 添加账户: {config.account_id}")
+
+    def get_available_accounts(
+        self,
+        required_quota_types: Optional[Iterable[str]] = None
+    ) -> List[AccountManager]:
+        """获取可用账户列表（过滤掉禁用、过期、冷却中的账户）
+
+        Args:
+            required_quota_types: 需要的配额类型列表（如 ["text"], ["images"], ["text", "videos"]）
+
+        Returns:
+            可用账户列表
+
+        过滤规则：
+            1. disabled=True → 跳过（手动禁用）
+            2. is_expired() → 跳过（账户过期）
+            3. are_quotas_available() → 跳过（配额冷却中）
+        """
+        available = []
+
+        for acc in self.accounts.values():
+            # 1. 检查手动禁用
+            if acc.config.disabled:
+                continue
+
+            # 2. 检查账户过期
+            if acc.config.is_expired():
+                continue
+
+            # 3. 检查配额可用性（包括冷却检查）
+            if not acc.are_quotas_available(required_quota_types):
+                continue
+
+            available.append(acc)
+
+        return available
 
     async def get_account(
         self,
@@ -530,7 +602,20 @@ class MultiAccountManager:
         request_id: str = "",
         required_quota_types: Optional[Iterable[str]] = None
     ) -> AccountManager:
-        """获取账户 - Round-Robin轮询"""
+        """获取账户 - Round-Robin轮询
+
+        Args:
+            account_id: 指定账户ID（可选，如果指定则直接返回该账户）
+            request_id: 请求ID（用于日志）
+            required_quota_types: 需要的配额类型列表
+
+        Returns:
+            可用的账户管理器
+
+        Raises:
+            HTTPException(404): 指定的账户不存在
+            HTTPException(503): 没有可用账户
+        """
         req_tag = f"[req_{request_id}] " if request_id else ""
 
         # 指定账户ID时直接返回
@@ -544,14 +629,8 @@ class MultiAccountManager:
                 raise HTTPException(503, f"Account {account_id} quota temporarily unavailable")
             return account
 
-        # 筛选可用账户
-        available_accounts = [
-            acc for acc in self.accounts.values()
-            if (acc.should_retry() and
-                not acc.config.is_expired() and
-                not acc.config.disabled and
-                acc.are_quotas_available(required_quota_types))
-        ]
+        # 获取可用账户列表
+        available_accounts = self.get_available_accounts(required_quota_types)
 
         if not available_accounts:
             raise HTTPException(503, "No available accounts")
@@ -668,9 +747,25 @@ def load_multi_account_config(
         # 检查账户是否已过期（已过期也加载到管理面板）
         is_expired = config.is_expired()
         if is_expired:
-            logger.warning(f"[CONFIG] 账户 {config.account_id} 已过期，仍加载用于展示")
+            logger.debug(f"[CONFIG] 账户 {config.account_id} 已过期，仍加载用于展示")
 
         manager.add_account(config, http_client, user_agent, retry_policy, global_stats)
+
+        # 从数据库恢复冷却状态和统计数据
+        account_mgr = manager.accounts[config.account_id]
+        if "quota_cooldowns" in acc:
+            account_mgr.quota_cooldowns = dict(acc["quota_cooldowns"])
+        if "generic_cooldown_until" in acc:
+            account_mgr.generic_cooldown_until = float(acc["generic_cooldown_until"])
+        if "permanently_disabled" in acc:
+            account_mgr.permanently_disabled = bool(acc["permanently_disabled"])
+            if account_mgr.permanently_disabled:
+                account_mgr.is_available = False
+        if "conversation_count" in acc:
+            account_mgr.conversation_count = int(acc.get("conversation_count", 0))
+        if "failure_count" in acc:
+            account_mgr.failure_count = int(acc.get("failure_count", 0))
+
         if is_expired:
             manager.accounts[config.account_id].is_available = False
 
@@ -700,6 +795,8 @@ def reload_accounts(
             "last_error_time": account_mgr.last_error_time,
             "session_usage_count": account_mgr.session_usage_count,
             "quota_cooldowns": dict(account_mgr.quota_cooldowns),
+            "generic_cooldown_until": account_mgr.generic_cooldown_until,
+            "permanently_disabled": account_mgr.permanently_disabled,
         }
 
     # Clear session cache and reload config.
@@ -722,6 +819,8 @@ def reload_accounts(
             account_mgr.last_error_time = stats.get("last_error_time", 0.0)
             account_mgr.session_usage_count = stats.get("session_usage_count", 0)
             account_mgr.quota_cooldowns = stats.get("quota_cooldowns", {})
+            account_mgr.generic_cooldown_until = stats.get("generic_cooldown_until", 0.0)
+            account_mgr.permanently_disabled = stats.get("permanently_disabled", False)
             logger.debug(f"[CONFIG] Account {account_id} refreshed; runtime state preserved")
 
     logger.info(
@@ -928,3 +1027,77 @@ def bulk_delete_accounts(
     success_count = len(deleted_ids)
     logger.info(f"[CONFIG] 批量删除 {success_count}/{len(account_ids)} 个账户")
     return multi_account_mgr, success_count, errors
+
+
+async def save_account_cooldown_state(account_id: str, account_mgr: AccountManager) -> bool:
+    """保存单个账户的冷却状态到数据库（优化版：单条更新）"""
+    if not storage.is_database_enabled():
+        return False
+
+    try:
+        cooldown_data = {
+            "quota_cooldowns": dict(account_mgr.quota_cooldowns),
+            "generic_cooldown_until": account_mgr.generic_cooldown_until,
+            "permanently_disabled": account_mgr.permanently_disabled,
+            "conversation_count": account_mgr.conversation_count,
+            "failure_count": account_mgr.failure_count,
+        }
+
+        success = await storage.update_account_cooldown(account_id, cooldown_data)
+        if success:
+            logger.debug(f"[COOLDOWN] 账户 {account_id} 冷却状态已保存")
+        else:
+            logger.warning(f"[COOLDOWN] 账户 {account_id} 不存在")
+        return success
+    except Exception as e:
+        logger.error(f"[COOLDOWN] 保存账户 {account_id} 冷却状态失败: {e}")
+        return False
+
+
+def save_account_cooldown_state_sync(account_id: str, account_mgr: AccountManager) -> bool:
+    """保存单个账户的冷却状态到数据库（同步版本）"""
+    try:
+        return asyncio.run(save_account_cooldown_state(account_id, account_mgr))
+    except Exception as e:
+        logger.error(f"[COOLDOWN] 同步保存账户 {account_id} 冷却状态失败: {e}")
+        return False
+
+
+async def save_all_cooldown_states(multi_account_mgr: MultiAccountManager) -> int:
+    """保存有冷却状态的账户到数据库（优化版：批量更新）"""
+    if not storage.is_database_enabled():
+        return 0
+
+    # 收集需要保存的账户
+    updates = []
+    for account_id, account_mgr in multi_account_mgr.accounts.items():
+        has_cooldown = (
+            account_mgr.quota_cooldowns or
+            account_mgr.generic_cooldown_until > 0 or
+            account_mgr.permanently_disabled or
+            account_mgr.conversation_count > 0 or
+            account_mgr.failure_count > 0
+        )
+
+        if has_cooldown:
+            cooldown_data = {
+                "quota_cooldowns": dict(account_mgr.quota_cooldowns),
+                "generic_cooldown_until": account_mgr.generic_cooldown_until,
+                "permanently_disabled": account_mgr.permanently_disabled,
+                "conversation_count": account_mgr.conversation_count,
+                "failure_count": account_mgr.failure_count,
+            }
+            updates.append((account_id, cooldown_data))
+
+    if not updates:
+        logger.info(f"[COOLDOWN] 无需保存：所有账户无冷却状态")
+        return 0
+
+    success_count, missing = await storage.bulk_update_accounts_cooldown(updates)
+
+    if missing:
+        logger.warning(f"[COOLDOWN] {len(missing)} 个账户不存在: {missing[:5]}")
+
+    logger.info(f"[COOLDOWN] 批量保存冷却状态: {success_count}/{len(updates)} 个账户（跳过 {len(multi_account_mgr.accounts) - len(updates)} 个无状态账户）")
+    return success_count
+

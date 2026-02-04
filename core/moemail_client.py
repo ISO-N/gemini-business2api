@@ -24,7 +24,7 @@ class MoemailClient:
 
     def __init__(
         self,
-        base_url: str = "https://moemail.app",
+        base_url: str = "https://moemail.nanohajimi.mom",
         proxy: str = "",
         api_key: str = "",
         domain: str = "",

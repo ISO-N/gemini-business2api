@@ -75,7 +75,7 @@ from core import uptime as uptime_tracker
 from core.config import config_manager, config
 
 # 数据库存储支持
-from core import storage
+from core import storage, account
 
 # 模型到配额类型的映射
 MODEL_TO_QUOTA_TYPE = {
@@ -131,14 +131,18 @@ async def load_stats():
     return data
 
 async def save_stats(stats):
-    """保存统计数据（异步）。数据库不可用时不落盘。"""
-    stats_to_save = stats.copy()
-    if isinstance(stats_to_save.get("request_timestamps"), deque):
-        stats_to_save["request_timestamps"] = list(stats_to_save["request_timestamps"])
-    if isinstance(stats_to_save.get("failure_timestamps"), deque):
-        stats_to_save["failure_timestamps"] = list(stats_to_save["failure_timestamps"])
-    if isinstance(stats_to_save.get("rate_limit_timestamps"), deque):
-        stats_to_save["rate_limit_timestamps"] = list(stats_to_save["rate_limit_timestamps"])
+    """保存统计数据(异步)。数据库不可用时不落盘。"""
+    def convert_deques(obj):
+        """递归转换所有 deque 对象为 list"""
+        if isinstance(obj, deque):
+            return list(obj)
+        elif isinstance(obj, dict):
+            return {k: convert_deques(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_deques(item) for item in obj]
+        return obj
+
+    stats_to_save = convert_deques(stats)
 
     if storage.is_database_enabled():
         try:
@@ -406,8 +410,6 @@ def get_tools_spec(model_name: str) -> dict:
 
 
 # ---------- 重试配置 ----------
-MAX_NEW_SESSION_TRIES = config.retry.max_new_session_tries
-MAX_REQUEST_RETRIES = config.retry.max_request_retries
 MAX_ACCOUNT_SWITCH_TRIES = config.retry.max_account_switch_tries
 SESSION_CACHE_TTL_SECONDS = config.retry.session_cache_ttl_seconds
 AUTO_REFRESH_ACCOUNTS_SECONDS = config.retry.auto_refresh_accounts_seconds
@@ -812,6 +814,33 @@ async def startup_event():
             logger.error(f"[SYSTEM] 启动登录服务失败: {e}")
     else:
         logger.info("[SYSTEM] 自动登录刷新未启用或依赖不可用")
+
+    # 启动冷却状态定期保存任务（每5分钟保存一次）
+    if storage.is_database_enabled():
+        asyncio.create_task(save_cooldown_states_task())
+        logger.info("[SYSTEM] 冷却状态定期保存任务已启动（间隔: 5分钟）")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """应用关闭时保存冷却状态"""
+    if storage.is_database_enabled():
+        try:
+            success_count = await account.save_all_cooldown_states(multi_account_mgr)
+            logger.info(f"[SYSTEM] 应用关闭，已保存 {success_count}/{len(multi_account_mgr.accounts)} 个账户的冷却状态")
+        except Exception as e:
+            logger.error(f"[SYSTEM] 关闭时保存冷却状态失败: {e}")
+
+
+async def save_cooldown_states_task():
+    """定期保存所有账户的冷却状态到数据库"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # 每5分钟执行一次
+            success_count = await account.save_all_cooldown_states(multi_account_mgr)
+            logger.debug(f"[COOLDOWN] 定期保存: {success_count}/{len(multi_account_mgr.accounts)} 个账户")
+        except Exception as e:
+            logger.error(f"[COOLDOWN] 定期保存失败: {e}")
 
 
 async def cleanup_database_task():
@@ -1575,6 +1604,12 @@ async def admin_disable_account(request: Request, account_id: str):
         multi_account_mgr = _update_account_disabled_status(
             account_id, True, multi_account_mgr
         )
+
+        # 立即保存当前状态到数据库，防止后台任务覆盖
+        if account_id in multi_account_mgr.accounts:
+            account_mgr = multi_account_mgr.accounts[account_id]
+            await account.save_account_cooldown_state(account_mgr, account_id)
+
         return {"status": "success", "message": f"账户 {account_id} 已禁用", "account_count": len(multi_account_mgr.accounts)}
     except Exception as e:
         logger.error(f"[CONFIG] 禁用账户失败: {str(e)}")
@@ -1594,7 +1629,12 @@ async def admin_enable_account(request: Request, account_id: str):
         if account_id in multi_account_mgr.accounts:
             account_mgr = multi_account_mgr.accounts[account_id]
             account_mgr.quota_cooldowns = {}
+            account_mgr.generic_cooldown_until = 0.0
+            account_mgr.permanently_disabled = False
             logger.info(f"[CONFIG] 账户 {account_id} 冷却状态已重置")
+
+            # 立即保存清空的冷却状态到数据库，防止后台任务覆盖
+            await account.save_account_cooldown_state(account_mgr, account_id)
 
         return {"status": "success", "message": f"账户 {account_id} 已启用", "account_count": len(multi_account_mgr.accounts)}
     except Exception as e:
@@ -1668,8 +1708,6 @@ async def admin_get_settings(request: Request):
             "output_format": config.video_generation.output_format
         },
         "retry": {
-            "max_new_session_tries": config.retry.max_new_session_tries,
-            "max_request_retries": config.retry.max_request_retries,
             "max_account_switch_tries": config.retry.max_account_switch_tries,
             "text_rate_limit_cooldown_seconds": config.retry.text_rate_limit_cooldown_seconds,
             "images_rate_limit_cooldown_seconds": config.retry.images_rate_limit_cooldown_seconds,
@@ -1697,7 +1735,7 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
     """更新系统设置"""
     global API_KEY, PROXY_FOR_AUTH, PROXY_FOR_CHAT, BASE_URL, LOGO_URL, CHAT_URL
     global IMAGE_GENERATION_ENABLED, IMAGE_GENERATION_MODELS
-    global MAX_NEW_SESSION_TRIES, MAX_REQUEST_RETRIES, MAX_ACCOUNT_SWITCH_TRIES
+    global MAX_ACCOUNT_SWITCH_TRIES
     global RETRY_POLICY
     global SESSION_CACHE_TTL_SECONDS, AUTO_REFRESH_ACCOUNTS_SECONDS
     global SESSION_EXPIRE_HOURS, multi_account_mgr, http_client, http_client_chat, http_client_auth
@@ -1785,8 +1823,6 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         CHAT_URL = config.public_display.chat_url
         IMAGE_GENERATION_ENABLED = config.image_generation.enabled
         IMAGE_GENERATION_MODELS = config.image_generation.supported_models
-        MAX_NEW_SESSION_TRIES = config.retry.max_new_session_tries
-        MAX_REQUEST_RETRIES = config.retry.max_request_retries
         MAX_ACCOUNT_SWITCH_TRIES = config.retry.max_account_switch_tries
         RETRY_POLICY = build_retry_policy()
         SESSION_CACHE_TTL_SECONDS = config.retry.session_cache_ttl_seconds
@@ -2198,11 +2234,12 @@ async def chat_impl(
                 cached_session = None
 
         if not cached_session:
-            # 新对话：轮询选择可用账户，失败时尝试其他账户
-            max_account_tries = min(MAX_NEW_SESSION_TRIES, len(multi_account_mgr.accounts))
+            # 新对话：尝试创建会话（遇到错误就切换账户）
+            available_accounts = multi_account_mgr.get_available_accounts(required_quota_types)
+            max_retries = min(MAX_ACCOUNT_SWITCH_TRIES, len(available_accounts))
             last_error = None
 
-            for attempt in range(max_account_tries):
+            for retry_idx in range(max_retries):
                 try:
                     account_manager = await multi_account_mgr.get_account(None, request_id, required_quota_types)
                     google_session = await create_google_session(account_manager, http_client, USER_AGENT, request_id)
@@ -2223,16 +2260,31 @@ async def chat_impl(
                     error_type = type(e).__name__
                     # 安全获取账户ID
                     account_id = account_manager.config.account_id if 'account_manager' in locals() and account_manager else 'unknown'
-                    logger.error(f"[CHAT] [req_{request_id}] 账户 {account_id} 创建会话失败 (尝试 {attempt + 1}/{max_account_tries}) - {error_type}: {str(e)}")
+                    logger.error(f"[CHAT] [req_{request_id}] 账户 {account_id} 创建会话失败 (尝试 {retry_idx + 1}/{max_retries}) - {error_type}: {str(e)}")
                     # 记录账号池状态（单个账户失败）
                     status_code = e.status_code if isinstance(e, HTTPException) else None
                     uptime_tracker.record_request("account_pool", False, status_code=status_code)
-                    if attempt == max_account_tries - 1:
+
+                    # 处理错误（标记冷却）
+                    if 'account_manager' in locals() and account_manager:
+                        quota_type = get_request_quota_type(req.model)
+                        if isinstance(e, HTTPException):
+                            account_manager.handle_http_error(status_code, str(e.detail) if hasattr(e, 'detail') else "", request_id, quota_type)
+                        else:
+                            account_manager.handle_non_http_error("创建会话", request_id, quota_type)
+
+                    if retry_idx == max_retries - 1:
                         logger.error(f"[CHAT] [req_{request_id}] 所有账户均不可用")
                         status = classify_error_status(503, last_error if isinstance(last_error, Exception) else Exception("account_pool_unavailable"))
                         await finalize_result(status, 503, f"All accounts unavailable: {str(last_error)[:100]}")
                         raise HTTPException(503, f"All accounts unavailable: {str(last_error)[:100]}")
                     # 继续尝试下一个账户
+
+    # 确保 account_manager 已成功获取
+    if account_manager is None:
+        logger.error(f"[CHAT] [req_{request_id}] 无可用账户")
+        await finalize_result("error", 503, "No available accounts")
+        raise HTTPException(503, "No available accounts")
 
     # 提取用户消息内容用于日志
     if req.messages:
@@ -2285,22 +2337,17 @@ async def chat_impl(
     async def response_wrapper():
         nonlocal account_manager  # 允许修改外层的 account_manager
 
-        retry_count = 0
-        max_retries = MAX_REQUEST_RETRIES  # 使用配置的最大重试次数
+        # 单层重试循环：遇到错误就切换账户
+        available_accounts = multi_account_mgr.get_available_accounts(required_quota_types)
+        max_retries = min(MAX_ACCOUNT_SWITCH_TRIES, len(available_accounts))
 
         current_text = text_to_send
         current_retry_mode = is_retry_mode
-
-        # 图片 ID 列表 (每次 Session 变化都需要重新上传，因为 fileId 绑定在 Session 上)
         current_file_ids = []
 
-        # 记录已失败的账户，避免重复使用
-        failed_accounts = set()
-
-        # 重试逻辑：最多尝试 max_retries+1 次（初次+重试）
-        while retry_count <= max_retries:
+        for retry_idx in range(max_retries):
             try:
-                # 安全：使用.get()防止缓存被清理导致KeyError
+                # 获取或创建 Session
                 cached = multi_account_mgr.global_session_cache.get(conv_key)
                 if not cached:
                     logger.warning(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 缓存已清理，重建Session")
@@ -2316,18 +2363,17 @@ async def chat_impl(
                 else:
                     current_session = cached["session_id"]
 
-                # A. 如果有图片且还没上传到当前 Session，先上传
-                # 注意：每次重试如果是新 Session，都需要重新上传图片
+                # 上传图片（如果需要）
                 if current_images and not current_file_ids:
                     for img in current_images:
                         fid = await upload_context_file(current_session, img["mime"], img["data"], account_manager, http_client, USER_AGENT, request_id)
                         current_file_ids.append(fid)
 
-                # B. 准备文本 (重试模式下发全文)
+                # 准备文本（重试模式下发全文）
                 if current_retry_mode:
                     current_text = build_full_context_text(req.messages)
 
-                # C. 发起对话
+                # 发起对话
                 async for chunk in stream_chat_generator(
                     current_session,
                     current_text,
@@ -2343,16 +2389,12 @@ async def chat_impl(
                     yield chunk
 
                 if getattr(request.state, "first_response_time", None) is None:
-                    # 空响应应该触发重试逻辑，抛出异常让下面的 except 块处理
+                    # 空响应应该触发重试逻辑
                     raise HTTPException(status_code=502, detail="Empty response from upstream")
 
-                # 请求成功
-                account_manager.conversation_count += 1  # 增加成功次数
-
-                # 记录账号池状态（请求成功）
+                # 请求成功（conversation_count 已在生成器内统计）
                 uptime_tracker.record_request("account_pool", True)
                 await finalize_result("success", 200, None)
-
                 break
 
             except (httpx.HTTPError, ssl.SSLError, HTTPException) as e:
@@ -2364,9 +2406,6 @@ async def chat_impl(
                     if is_http_exception
                     else f"{type(e).__name__}: {str(e)[:200]}"
                 )
-
-                # 记录当前失败的账户
-                failed_accounts.add(account_manager.config.account_id)
 
                 # 记录账号池状态（请求失败）
                 uptime_tracker.record_request("account_pool", False, status_code=status_code)
@@ -2380,46 +2419,13 @@ async def chat_impl(
                 else:
                     account_manager.handle_non_http_error("聊天请求", request_id, quota_type)
 
-                retry_count += 1
-
                 # 检查是否还能继续重试
-                if retry_count <= max_retries:
-                    logger.warning(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 正在重试 ({retry_count}/{max_retries})")
+                if retry_idx < max_retries - 1:
+                    logger.warning(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 切换账户重试 ({retry_idx + 1}/{max_retries})")
 
-                    # 快速失败：检查是否还有可用账户（避免无效重试）
-                    available_count = sum(
-                        1 for acc in multi_account_mgr.accounts.values()
-                        if (acc.should_retry() and
-                            not acc.config.is_expired() and
-                            not acc.config.disabled and
-                            acc.are_quotas_available(required_quota_types) and
-                            acc.config.account_id not in failed_accounts)
-                    )
-
-                    if available_count == 0:
-                        logger.error(f"[CHAT] [req_{request_id}] 所有账户均不可用，快速失败")
-                        await finalize_result("error", 503, "All accounts unavailable")
-                        if req.stream: yield f"data: {json.dumps({'error': {'message': 'All accounts unavailable'}})}\n\n"
-                        return
-
-                    # 尝试切换到其他账户（客户端会传递完整上下文）
+                    # 尝试切换到其他账户
                     try:
-                        # 获取新账户，跳过已失败的账户
-                        max_account_tries = min(MAX_ACCOUNT_SWITCH_TRIES, available_count)  # 限制尝试次数
-                        new_account = None
-
-                        for _ in range(max_account_tries):
-                            candidate = await multi_account_mgr.get_account(None, request_id, required_quota_types)
-                            if candidate.config.account_id not in failed_accounts:
-                                new_account = candidate
-                                break
-
-                        if not new_account:
-                            logger.error(f"[CHAT] [req_{request_id}] 所有可用账户均已失败")
-                            await finalize_result("error", 503, "All available accounts failed")
-                            if req.stream: yield f"data: {json.dumps({'error': {'message': 'All available accounts failed'}})}\n\n"
-                            return
-
+                        new_account = await multi_account_mgr.get_account(None, request_id, required_quota_types)
                         logger.info(f"[CHAT] [req_{request_id}] 切换账户: {account_manager.config.account_id} -> {new_account.config.account_id}")
 
                         # 创建新 Session
@@ -2445,11 +2451,9 @@ async def chat_impl(
                         logger.error(f"[CHAT] [req_{request_id}] 账户切换失败 ({error_type}): {str(create_err)}")
                         # 记录账号池状态（账户切换失败）
                         status_code = create_err.status_code if isinstance(create_err, HTTPException) else None
-
                         uptime_tracker.record_request("account_pool", False, status_code=status_code)
 
                         status = classify_error_status(status_code, create_err)
-
                         await finalize_result(status, status_code, f"Account Failover Failed: {str(create_err)[:200]}")
                         if req.stream: yield f"data: {json.dumps({'error': {'message': 'Account Failover Failed'}})}\n\n"
                         return
@@ -2458,7 +2462,7 @@ async def chat_impl(
                     logger.error(f"[CHAT] [req_{request_id}] 已达到最大重试次数 ({max_retries})，请求失败")
                     status = classify_error_status(status_code, e)
                     await finalize_result(status, status_code, error_detail)
-                    if req.stream: yield f"data: {json.dumps({'error': {'message': f'Max retries ({max_retries}) exceeded: {e}'}})}\n\n"
+                    if req.stream: yield f"data: {json.dumps({'error': {'message': f'Max retries ({max_retries}) exceeded: {error_detail}'}})}\n\n"
                     return
 
     if req.stream:
@@ -2702,15 +2706,86 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
 
         # 使用异步解析器处理 JSON 数组流
         try:
+            response_count = 0
             async for json_obj in parse_json_array_stream_async(r.aiter_lines()):
+                response_count += 1
                 json_objects.append(json_obj)  # 收集响应
 
+                # 记录原始响应结构（用于调试空响应）
+                logger.debug(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 收到响应#{response_count}: {json.dumps(json_obj, ensure_ascii=False)[:1000]}")
+
+                # 检查是否有错误或政策违规信息
+                if "error" in json_obj:
+                    logger.warning(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 上游返回错误: {json.dumps(json_obj.get('error'), ensure_ascii=False)}")
+
+                stream_response = json_obj.get("streamAssistResponse", {})
+                answer = stream_response.get("answer", {})
+
+                # 检查是否被政策阻止
+                answer_state = answer.get("state", "")
+                if answer_state == "SKIPPED":
+                    skip_reasons = answer.get("assistSkippedReasons", [])
+                    policy_result = answer.get("customerPolicyEnforcementResult", {})
+
+                    if "CUSTOMER_POLICY_VIOLATION" in skip_reasons:
+                        # 提取具体的违规信息（用于日志）
+                        policy_results = policy_result.get("policyResults", [])
+                        violation_detail = ""
+
+                        for policy in policy_results:
+                            armor_result = policy.get("modelArmorEnforcementResult", {})
+                            if armor_result:
+                                violation_detail = armor_result.get("modelArmorViolation", "")
+                                if violation_detail:
+                                    break
+
+                        logger.warning(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 内容被安全策略阻止: {violation_detail or 'CUSTOMER_POLICY_VIOLATION'}")
+
+                        # 向用户返回官方风格的错误信息
+                        error_text = "\n⚠️ 违反政策\n\n由于提示违反了 Google 定义的安全政策，因此 Gemini 无法回复。\n\n请修改提示以符合安全政策。\n"
+
+                        if first_response_time is None:
+                            first_response_time = time.time()
+                            if request is not None:
+                                request.state.first_response_time = first_response_time
+
+                        full_content += error_text
+                        chunk = create_chunk(chat_id, created_time, model_name, {"content": error_text}, None)
+                        yield f"data: {chunk}\n\n"
+                        continue
+                    elif skip_reasons:
+                        # 处理其他跳过原因
+                        reason_text = ", ".join(skip_reasons)
+                        logger.warning(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 响应被跳过: {reason_text}")
+
+                        error_text = f"\n⚠️ 抱歉，无法生成响应。\n\n原因：{reason_text}\n\n请稍后重试或联系管理员。\n"
+
+                        if first_response_time is None:
+                            first_response_time = time.time()
+                            if request is not None:
+                                request.state.first_response_time = first_response_time
+
+                        full_content += error_text
+                        chunk = create_chunk(chat_id, created_time, model_name, {"content": error_text}, None)
+                        yield f"data: {chunk}\n\n"
+                        continue
+
+                replies = answer.get("replies", [])
+
+                # 记录replies数量
+                if not replies:
+                    logger.debug(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 响应#{response_count}无replies，完整answer结构: {json.dumps(answer, ensure_ascii=False)[:500]}")
+                else:
+                    logger.debug(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 响应#{response_count}包含{len(replies)}个replies")
+
                 # 提取文本内容
-                for reply in json_obj.get("streamAssistResponse", {}).get("answer", {}).get("replies", []):
+                for idx, reply in enumerate(replies):
                     content_obj = reply.get("groundedContent", {}).get("content", {})
                     text = content_obj.get("text", "")
 
                     if not text:
+                        # 记录为什么没有text
+                        logger.debug(f"[API] [{account_manager.config.account_id}] [req_{request_id}] Reply#{idx}无text，content_obj结构: {json.dumps(content_obj, ensure_ascii=False)[:300]}")
                         continue
 
                     # 区分思考过程和正常内容
@@ -2727,6 +2802,8 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                             first_response_time = time.time()
                             if request is not None:
                                 request.state.first_response_time = first_response_time
+                            # 第一次响应时统计成功次数
+                            account_manager.conversation_count += 1
                         # 正常内容使用 content 字段
                         full_content += text
                         chunk = create_chunk(chat_id, created_time, model_name, {"content": text}, None)
@@ -2738,6 +2815,15 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                 if file_ids and session_name:
                     file_ids_info = (file_ids, session_name)
                     logger.info(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 检测到{len(file_ids)}张生成图片")
+
+            # 记录流处理总结
+            logger.info(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 流处理完成: 收到{response_count}个响应对象, 累计内容长度{len(full_content)}字符")
+            if response_count > 0 and len(full_content) == 0:
+                logger.warning(f"[API] [{account_manager.config.account_id}] [req_{request_id}] ⚠️ 空响应警告: 收到{response_count}个响应但无文本内容，可能是政策违规或上游错误")
+                # 打印第一个响应对象的完整结构用于调试
+                if json_objects:
+                    logger.warning(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 第一个响应完整结构: {json.dumps(json_objects[0], ensure_ascii=False)}")
+
 
         except ValueError as e:
             uptime_tracker.record_request(model_name, False)
@@ -2819,6 +2905,9 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
     if full_content:
         response_preview = full_content[:500] + "...(已截断)" if len(full_content) > 500 else full_content
         logger.info(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] AI响应: {response_preview}")
+    else:
+        logger.warning(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] ⚠️ 最终响应为空，请检查上游日志")
+
 
     if first_response_time:
         latency_ms = int((first_response_time - start_time) * 1000)
