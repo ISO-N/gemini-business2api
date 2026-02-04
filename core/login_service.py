@@ -97,6 +97,7 @@ class LoginService(BaseTaskService[LoginTask]):
 
         功能说明：
         - 将本批次（scheduled）的刷新成功数累加到指定节点（mihomo_now）名下；
+        - 当本批次成功数为 0 时，也会“初始化”该节点键（写入 0），用于记录“该节点被使用过但本批次无成功”；
         - 该统计用于个人自用筛选“更好的节点/出口 IP”，不影响业务逻辑；
         - 采用“原子写入（临时文件 + os.replace）”避免进程异常时写坏文件；
         - 异常场景直接返回 None，由调用方决定是否记录日志（best effort）。
@@ -113,9 +114,11 @@ class LoginService(BaseTaskService[LoginTask]):
             inc = int(add_success_count or 0)
         except Exception:
             inc = 0
+        # 成功数不允许为负数；若出现异常值按 0 处理，避免写入负统计导致误判。
+        inc = max(inc, 0)
 
-        # 节点名为空或无需累加时直接跳过（避免写入无意义数据）。
-        if not name or inc <= 0:
+        # 节点名为空时直接跳过（无法建立有效统计键）。
+        if not name:
             return None
 
         # 确保 data/ 目录存在（运行态目录，通常由用户挂载或启动时创建）。
@@ -147,6 +150,10 @@ class LoginService(BaseTaskService[LoginTask]):
                 totals = {}
 
             current = int(totals.get(name, 0) or 0)
+            # 当 inc==0 且节点已存在时不写入文件，避免无意义的重复 IO。
+            if inc == 0 and name in totals:
+                return current
+
             new_total = current + inc
             totals[name] = new_total
 
@@ -440,7 +447,7 @@ class LoginService(BaseTaskService[LoginTask]):
                     snapshot = None
                     now_node = ""
 
-            if now_node and int(task.success_count or 0) > 0:
+            if now_node:
                 new_total = await asyncio.to_thread(
                     self._update_mihomo_node_success_totals_sync,
                     now_node,
