@@ -74,11 +74,18 @@ async def make_request_with_jwt_retry(
     if extra_headers:
         headers.update(extra_headers)
 
+    # 提取timeout参数（如果有），单独传给httpx
+    req_timeout = kwargs.pop("timeout", None)
+
     # 发起请求
+    req_kwargs = {**kwargs}
+    if req_timeout is not None:
+        req_kwargs["timeout"] = req_timeout
+
     if method.upper() == "GET":
-        resp = await http_client.get(url, headers=headers, **kwargs)
+        resp = await http_client.get(url, headers=headers, **req_kwargs)
     elif method.upper() == "POST":
-        resp = await http_client.post(url, headers=headers, **kwargs)
+        resp = await http_client.post(url, headers=headers, **req_kwargs)
     else:
         raise ValueError(f"Unsupported HTTP method: {method}")
 
@@ -90,9 +97,9 @@ async def make_request_with_jwt_retry(
             headers.update(extra_headers)
 
         if method.upper() == "GET":
-            resp = await http_client.get(url, headers=headers, **kwargs)
+            resp = await http_client.get(url, headers=headers, **req_kwargs)
         elif method.upper() == "POST":
-            resp = await http_client.post(url, headers=headers, **kwargs)
+            resp = await http_client.post(url, headers=headers, **req_kwargs)
 
     return resp
 
@@ -119,6 +126,7 @@ async def create_google_session(
         f"{GEMINI_API_BASE}/locations/global/widgetCreateSession",
         headers=headers,
         json=body,
+        timeout=30.0,
     )
     if r.status_code != 200:
         logger.error(f"[SESSION] [{account_manager.config.account_id}] {req_tag}Session 创建失败: {r.status_code}")
@@ -160,6 +168,7 @@ async def upload_context_file(
         f"{GEMINI_API_BASE}/locations/global/widgetAddContextFile",
         headers=headers,
         json=body,
+        timeout=60.0,
     )
 
     req_tag = f"[req_{request_id}] " if request_id else ""
@@ -208,7 +217,8 @@ async def get_session_file_metadata(
         http_client,
         user_agent,
         request_id,
-        json=body
+        json=body,
+        timeout=30.0
     )
 
     if resp.status_code != 200:

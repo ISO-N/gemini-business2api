@@ -282,26 +282,6 @@
               </div>
             </div>
             <div>
-              <p>冷却</p>
-              <p class="mt-1 flex items-center gap-1" :class="cooldownClass(account)">
-                <template v-if="cooldownDisplay(account) === 'normal'">
-                  <svg class="h-3.5 w-3.5 text-emerald-500" viewBox="0 0 20 20" fill="currentColor">
-                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" />
-                  </svg>
-                  <span>正常</span>
-                </template>
-                <template v-else-if="cooldownDisplay(account) === 'disabled'">
-                  <svg class="h-3.5 w-3.5 text-muted-foreground" viewBox="0 0 20 20" fill="currentColor">
-                    <path fill-rule="evenodd" d="M13.477 14.89A6 6 0 015.11 6.524l8.367 8.368zm1.414-1.414L6.524 5.11a6 6 0 018.367 8.367zM18 10a8 8 0 11-16 0 8 8 0 0116 0z" clip-rule="evenodd" />
-                  </svg>
-                  <span>手动禁用</span>
-                </template>
-                <template v-else>
-                  {{ cooldownDisplay(account) }}
-                </template>
-              </p>
-            </div>
-            <div>
               <p>失败数</p>
               <p class="mt-1 text-sm font-semibold text-foreground">{{ account.failure_count }}</p>
             </div>
@@ -368,7 +348,6 @@
                 </span>
               </th>
               <th class="py-3 pr-6">配额</th>
-              <th class="py-3 pr-6">冷却</th>
               <th class="py-3 pr-6">失败数</th>
               <th class="py-3 pr-6">成功数</th>
               <th class="py-3 text-right">操作</th>
@@ -376,7 +355,7 @@
           </thead>
           <tbody class="text-sm text-foreground">
             <tr v-if="!filteredAccounts.length && !isLoading">
-              <td colspan="9" class="py-8 text-center text-muted-foreground">
+              <td colspan="8" class="py-8 text-center text-muted-foreground">
                 暂无账号数据，请检查后台配置。
               </td>
             </tr>
@@ -415,25 +394,6 @@
               <td class="py-4 pr-6">
                 <QuotaBadge v-if="account.quota_status" :quota-status="account.quota_status" />
                 <span v-else class="text-xs text-muted-foreground">-</span>
-              </td>
-              <td class="py-4 pr-6 text-xs" :class="cooldownClass(account)">
-                <span class="flex items-center gap-1">
-                  <template v-if="cooldownDisplay(account) === 'normal'">
-                    <svg class="h-3.5 w-3.5 text-emerald-500" viewBox="0 0 20 20" fill="currentColor">
-                      <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" />
-                    </svg>
-                    <span>正常</span>
-                  </template>
-                  <template v-else-if="cooldownDisplay(account) === 'disabled'">
-                    <svg class="h-3.5 w-3.5 text-muted-foreground" viewBox="0 0 20 20" fill="currentColor">
-                      <path fill-rule="evenodd" d="M13.477 14.89A6 6 0 015.11 6.524l8.367 8.368zm1.414-1.414L6.524 5.11a6 6 0 018.367 8.367zM18 10a8 8 0 11-16 0 8 8 0 0116 0z" clip-rule="evenodd" />
-                    </svg>
-                    <span>手动禁用</span>
-                  </template>
-                  <template v-else>
-                    {{ cooldownDisplay(account) }}
-                  </template>
-                </span>
               </td>
               <td class="py-4 pr-6 text-xs text-muted-foreground">
                 {{ account.failure_count }}
@@ -602,9 +562,6 @@
             </p>
             <p class="mt-1 text-muted-foreground">详细声明请查看项目 <a href="https://github.com/Dreamy-rain/gemini-business2api/blob/main/docs/DISCLAIMER.md" target="_blank" class="text-primary hover:underline font-medium">DISCLAIMER.md</a></p>
           </div>
-          <Checkbox v-model="registerAgreed">
-            我已阅读并同意上述说明与限制
-          </Checkbox>
           </div>
         </div>
 
@@ -621,7 +578,7 @@
               v-if="addMode === 'register'"
               class="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity
                      hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="isRegistering || !registerAgreed"
+              :disabled="isRegistering"
               @click="handleRegister"
             >
               开始注册
@@ -630,7 +587,7 @@
               v-else
               class="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity
                      hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="isImporting || !registerAgreed"
+              :disabled="isImporting"
               @click="handleImport"
             >
               导入并保存
@@ -1578,7 +1535,6 @@ watch(
 type TaskLogLine = { time: string; level: string; message: string }
 const registerLogClearMarker = ref<TaskLogLine | null>(null)
 const loginLogClearMarker = ref<TaskLogLine | null>(null)
-const registerAgreed = ref(false)
 const registerTask = ref<RegisterTask | null>(null)
 const loginTask = ref<LoginTask | null>(null)
 const refreshingAccountIds = ref<Set<string>>(new Set())  // 正在刷新的账户ID集合（仅用于显示状态）
@@ -1966,7 +1922,6 @@ const openRegisterModal = () => {
   importError.value = ''
   isImporting.value = false
   importFileName.value = ''
-  registerAgreed.value = false
   // 重置为设置中的邮箱服务提供商
   selectedMailProvider.value = settings.value?.basic?.temp_mail_provider || defaultMailProvider
 }
@@ -2139,14 +2094,29 @@ const handleImportFile = async (event: Event) => {
     const content = await file.text()
     if (file.name.toLowerCase().endsWith('.json') || file.type.includes('json')) {
       const parsed = JSON.parse(content)
-      const list = Array.isArray(parsed) ? parsed : parsed?.accounts
-      if (!Array.isArray(list)) {
+      const importList = Array.isArray(parsed) ? parsed : parsed?.accounts
+      if (!Array.isArray(importList)) {
         importError.value = 'JSON 格式错误：需要数组或包含 accounts 字段'
         return
       }
-      await accountsStore.updateConfig(list)
-      selectedIds.value = new Set(list.map((item: any) => item.id).filter(Boolean))
-      toast.success(`导入 ${list.length} 条账号配置`)
+      const existing = await loadConfigList()
+      const next = [...existing]
+      const indexMap = new Map(next.map((acc, idx) => [acc.id, idx]))
+      const importedIds: string[] = []
+
+      importList.forEach((item: any) => {
+        const idx = indexMap.get(item.id || '')
+        if (idx === undefined) {
+          next.push(item)
+        } else {
+          next[idx] = { ...next[idx], ...item }
+        }
+        if (item.id) importedIds.push(item.id)
+      })
+
+      await accountsStore.updateConfig(next)
+      selectedIds.value = new Set(importedIds)
+      toast.success(`导入 ${importList.length} 条账号配置`)
       closeRegisterModal()
       return
     }
@@ -2767,40 +2737,6 @@ const remainingClass = (account: AdminAccount) => {
   if (account.status === '即将过期') return 'text-amber-700'
   if (account.status === '未设置') return 'text-muted-foreground'
   return 'text-emerald-600'
-}
-
-const formatCooldown = (seconds: number) => {
-  if (seconds < 60) return `${seconds} 秒`
-  if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分钟`
-  return `${(seconds / 3600).toFixed(1)} 小时`
-}
-
-const cooldownClass = (account: AdminAccount) => {
-  // 配额冷却：黄色（警告）
-  if (account.cooldown_seconds > 0) {
-    return 'text-yellow-600'
-  }
-  // 手动禁用：灰色
-  if (account.disabled) {
-    return 'text-muted-foreground'
-  }
-  // 正常：绿色
-  return 'text-emerald-600'
-}
-
-const cooldownDisplay = (account: AdminAccount) => {
-  // 有冷却时间：显示倒计时 + 原因
-  if (account.cooldown_seconds > 0) {
-    return `${formatCooldown(account.cooldown_seconds)} · ${account.cooldown_reason || '冷却中'}`
-  }
-
-  // 手动禁用
-  if (account.disabled) {
-    return 'disabled'
-  }
-
-  // 正常可用
-  return 'normal'
 }
 
 const rowClass = (account: AdminAccount) => {

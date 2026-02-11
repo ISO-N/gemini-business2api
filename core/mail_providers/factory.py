@@ -26,8 +26,10 @@ def create_temp_mail_client(
     """
     provider = (provider or "duckmail").lower()
     if proxy is None:
-        proxy = config.basic.proxy_for_auth if config.basic.mail_proxy_enabled else ""
-    proxy, no_proxy = parse_proxy_setting(proxy if config.basic.mail_proxy_enabled else "")
+        proxy_source = config.basic.proxy_for_auth if config.basic.mail_proxy_enabled else ""
+    else:
+        proxy_source = proxy
+    proxy, no_proxy = parse_proxy_setting(proxy_source)
 
     if provider == "moemail":
         effective_base_url = base_url or config.basic.moemail_base_url

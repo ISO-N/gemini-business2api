@@ -233,8 +233,11 @@ class GeminiAutomation:
         - dict：与 login_and_extract 相同的 success/config/error 结构
         """
 
-        # 记录开始时间，用于邮件时间过滤（传入邮箱客户端用于“只读取该时间之后的邮件”）
-        send_time = datetime.now()
+        # 记录任务开始时间，用于邮件时间过滤（全流程固定，不随重发更新）。
+        # 说明：
+        # - 这里使用“任务开始时间”而不是“每次发送时间”，避免“重发验证码”导致 since_time 前移，
+        #   从而错过首封验证码邮件（部分邮箱存在投递延迟、或同一线程多封邮件的时间戳不稳定）。
+        task_start_time = datetime.now()
 
         # Step 1: 导航到首页并设置 Cookie
         self._log("info", f"🌐 打开登录页面: {email}")
@@ -317,17 +320,15 @@ class GeminiAutomation:
 
         # Step 5: 轮询邮件获取验证码（3次，每次5秒间隔）
         self._log("info", "📬 等待邮箱验证码...")
-        code = mail_client.poll_for_code(timeout=15, interval=5, since_time=send_time)
+        code = mail_client.poll_for_code(timeout=15, interval=5, since_time=task_start_time)
 
         if not code:
             self._log("warning", "⚠️ 验证码超时，15秒后重新发送...")
             time.sleep(15)
-            # 更新发送时间（在点击按钮之前记录）
-            send_time = datetime.now()
             # 尝试点击重新发送按钮
             if self._click_resend_code_button(page):
                 # 再次轮询验证码（3次，每次5秒间隔）
-                code = mail_client.poll_for_code(timeout=15, interval=5, since_time=send_time)
+                code = mail_client.poll_for_code(timeout=15, interval=5, since_time=task_start_time)
                 if not code:
                     self._log("error", "❌ 重新发送后仍未收到验证码")
                     self._save_screenshot(page, "code_timeout_after_resend")

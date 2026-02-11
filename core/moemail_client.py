@@ -330,7 +330,7 @@ class MoemailClient:
         since_time=None,
     ) -> Optional[str]:
         """轮询获取验证码"""
-        max_retries = timeout // interval
+        max_retries = max(1, timeout // interval)
         self._log("info", f"⏱️ 开始轮询验证码 (超时 {timeout}秒, 间隔 {interval}秒, 最多 {max_retries} 次)")
 
         for i in range(1, max_retries + 1):

@@ -53,7 +53,7 @@ def parse_proxy_setting(proxy_str: str) -> Tuple[str, str]:
         if no_proxy_match:
             no_proxy = no_proxy_match.group(1).strip()
 
-    return proxy_url, no_proxy
+    return normalize_proxy_url(proxy_url), no_proxy
 
 
 def extract_host(url: str) -> str:
